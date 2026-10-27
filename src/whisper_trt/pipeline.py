@@ -158,12 +158,6 @@ class Whisper:
         cache[..., :p, :] = new_kv
         return logits
 
-    def _prefill(self, windows: int, slots: slice, tokens: torch.Tensor, cache: torch.Tensor,
-                 src: torch.Tensor) -> torch.Tensor:
-        """A Search's prefill of the rows of consecutive slots (see Search.stream)."""
-        key = ("prefill", windows, slots.start, slots.stop, *tokens.shape, cache.data_ptr())
-        return self._decoder(key, tokens, cache, src, self.cross(windows)[:, :, slots])
-
     def prompt(
         self,
         language: str | None,
@@ -210,8 +204,8 @@ class Whisper:
         suppress = self.tokenizer.suppressed_tokens(suppress_tokens)
         begin = self.cfg.begin_suppress_tokens if suppress_blank else ()
         rows_t = torch.tensor(prompts, dtype=torch.long)
-        return search.run(rows_t, partial(self._prefill, windows), list(suppress), list(begin),
-                          temperature=temperature if temperature > 0 else 1.0, seed=seed)
+        return search.run(rows_t, list(suppress), list(begin), temperature=temperature if temperature > 0 else 1.0,
+                          seed=seed)
 
     @_on_stream
     def decode(
@@ -253,8 +247,8 @@ class Whisper:
 
         suppress = self.tokenizer.suppressed_tokens(suppress_tokens)
         begin = self.cfg.begin_suppress_tokens if suppress_blank else ()
-        return search.stream([prompt] * len(audio), load, partial(self._prefill, slots), list(suppress),
-                             list(begin), temperature=temperature if temperature > 0 else 1.0, seed=seed)
+        return search.stream([prompt] * len(audio), load, list(suppress), list(begin),
+                             temperature=temperature if temperature > 0 else 1.0, seed=seed)
 
     @_on_stream
     def detect_language(self, cross: torch.Tensor) -> list[list[tuple[str, float]]]:

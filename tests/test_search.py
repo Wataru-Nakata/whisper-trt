@@ -47,20 +47,6 @@ def fake_step(seed: int):
     return step_fn
 
 
-def fake_prefill(seed: int):
-    def prefill(slots, tokens, cache, src):
-        k, p = tokens.shape
-        out = torch.zeros(k, p, V)
-        for i in range(k):
-            toks = tokens[i].tolist()
-            for j in range(p):
-                out[i, j] = scores_of(toks[: j + 1], seed).float()
-            cache[0, :, i, 0, :p, :] = tokens[i].float()[None, :, None]
-        return out
-
-    return prefill
-
-
 def masked_logp(history: list[int], seed: int, suppress, begin, first: bool) -> torch.Tensor:
     x = scores_of(history, seed).float()
     x[list(suppress)] = LOWEST
@@ -122,7 +108,7 @@ def test_search_matches_ct2(seed, mode, K):
     prompts = torch.tensor([[SOT, 10 + w, 20, 30] for w in range(W)])
     search = Search(cfg, fake_step(seed), W, K, P, mode, dtype=torch.float32, device="cpu", max_length=40,
                     graphs=False)
-    results = search.run(prompts, fake_prefill(seed), suppress, begin, check_every=1)
+    results = search.run(prompts, suppress, begin, check_every=1)
     for w in range(W):
         prompt = prompts[w].tolist()
         if mode == "beam":
@@ -143,7 +129,7 @@ def test_search_reaches_limit():
     prompts = torch.tensor([[SOT, 10, 20, 30]])
     search = Search(cfg, fake_step(0), 1, 2, 4, "beam", dtype=torch.float32, device="cpu", max_length=14,
                     graphs=False)
-    res = search.run(prompts, fake_prefill(0), [EOT], [], check_every=1)[0]  # EOS suppressed
+    res = search.run(prompts, [EOT], [], check_every=1)[0]  # EOS suppressed
     assert res.reached_max_length and len(res.tokens) == search.max_new
     toks, _ = ct2_beam(prompts[0].tolist(), 2, search.max_new, 0, [EOT], [])
     assert res.tokens == toks
@@ -161,8 +147,8 @@ def test_refilled_slots_match_independent_decodes(mode, K, check_every):
     search = Search(cfg, fake_step(seed), 3, K, P, mode, dtype=torch.float32, device="cpu", max_length=40,
                     graphs=False)
     loaded = []
-    results = search.stream(prompts, lambda slots, windows: loaded.append((slots, windows)), fake_prefill(seed),
-                            suppress, begin, check_every=check_every)
+    results = search.stream(prompts, lambda slots, windows: loaded.append((slots, windows)), suppress, begin,
+                            check_every=check_every)
     assert sorted(w for _, ws in loaded for w in ws) == list(range(M))
     assert len(loaded) > 1  # (refilled at least once)
     for w, prompt in enumerate(prompts):

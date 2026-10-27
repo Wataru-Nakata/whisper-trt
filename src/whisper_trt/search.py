@@ -14,9 +14,10 @@ slot):
 
 Every step disables the suppressed tokens (to the lowest float, as ``DisableTokens``), and a window's first step
 also the "begin" tokens (blank, EOS). At most ``min(max_length // 2, max_length - (prompt length - 1))`` tokens
-are generated (224 for Whisper's 448, the limit faster-whisper users meet). As in CTranslate2, the prompt but
-its last token is prefilled, and the last one is fed by the first step. The no-speech probability is the
-softmax of the prefill's logits at <|startoftranscript|> at <|nospeech|>.
+are generated (224 for Whisper's 448, the limit faster-whisper users meet). A window's prompt tokens are fed by
+steps too (forced tokens, no search), so loading a window into a slot is a few state writes: no prefill call,
+no host synchronization. The no-speech probability is the softmax of the logits at <|startoftranscript|> at
+<|nospeech|>, as CTranslate2 takes it from its prompt's forward pass.
 
 A step is all device work (decoder call, token choice) on fixed buffers, captured in one CUDA graph; every slot
 has its own position, so windows of any lengths share the steps. The host checks the slots every few steps and
@@ -123,14 +124,16 @@ class Search:
         self.cache = torch.zeros(L, 2, N, H, C, dk, dtype=dtype, device=dev)
         self.src = torch.zeros(N, C, dtype=torch.int32, device=dev)
         self.src_scratch = torch.zeros_like(self.src)
-        # a prefill's table: the slots of its own rows, numbered from its first row (the call sees only them)
-        self.src_local = torch.arange(N, dtype=torch.int32, device=dev)[:, None].repeat(1, C)
         self.row_ids = torch.arange(N, dtype=torch.int32, device=dev)[:, None]
         self.row_ar = torch.arange(N, device=dev)
         self.tokens = torch.zeros(N, 1, dtype=torch.long, device=dev)
         self.offset = torch.zeros(N, dtype=torch.long, device=dev)
         self.pos = torch.zeros(B, dtype=torch.long, device=dev)  # per slot: cache slot of the token fed next
-        self.t = torch.zeros(B, dtype=torch.long, device=dev)  # per slot: tokens generated so far
+        # per slot: tokens generated so far; negative while the prompt is fed (-(P-1) at its first token)
+        self.t = torch.zeros(B, dtype=torch.long, device=dev)
+        self.forced = torch.zeros(B, prompt_length + 1, dtype=torch.long, device=dev)  # the slots' prompts
+        self.sot_pos = torch.zeros(B, dtype=torch.long, device=dev)  # position of <|startoftranscript|>
+        self.no_speech = torch.zeros(B, dtype=torch.float32, device=dev)
         self.logits = torch.zeros(N, 1, V, dtype=torch.float32, device=dev)
         self.new_kv = torch.zeros(L, 2, N, H, 1, dk, dtype=dtype, device=dev)
         self.suppress = torch.zeros(V, dtype=torch.bool, device=dev)
@@ -166,6 +169,9 @@ class Search:
         self._step()
         self.cache[:, :, self.row_ar, :, self.offset, :] = self.new_kv[:, :, :, :, 0, :].permute(2, 0, 1, 3, 4)
         self.src[self.row_ar, self.offset] = self.row_ids[:, 0]
+        lg = self.logits[:: self.K, 0]  # [B, V] (a window's rows are the same until its first step)
+        ns = (lg[:, self.cfg.no_speech] - lg.logsumexp(-1)).exp()
+        self.no_speech.copy_(torch.where(self.pos == self.sot_pos, ns, self.no_speech))
         self._choose(self.logits[:, 0])
         live = (~self.done).long()  # (a window that ended stays at its last step, within the buffers)
         self.pos += live
@@ -191,10 +197,19 @@ class Search:
         first = (self.t == 0).repeat_interleave(self.K)[:, None]  # [N, 1]: a window's first step
         logits = logits.masked_fill(self.suppress, LOWEST).masked_fill(self.begin & first, LOWEST)
         logp = logits.log_softmax(-1)  # [N, V]
+        prompt = (self.t < 0).repeat_interleave(self.K)  # [N]: rows still fed their prompt
+        kept = (self.hist.clone(), self.cum.clone(), self.src.clone())
         if self.mode == "beam":
-            self._beam(logp)
+            self._beam(logp, prompt)
         else:
-            self._greedy(logp)
+            self._greedy(logp, prompt)
+        # rows in their prompt: the next prompt token, nothing else changes
+        hist, cum, src = kept
+        self.hist.copy_(torch.where(prompt[:, None], hist, self.hist))
+        self.cum.copy_(torch.where(prompt, cum, self.cum))
+        self.src.copy_(torch.where(prompt[:, None], src, self.src))
+        nxt = self.forced.gather(1, (self.P + self.t).clamp(max=self.P)[:, None])[:, 0].repeat_interleave(self.K)
+        self.tokens.copy_(torch.where(prompt, nxt, self.tokens[:, 0])[:, None])
 
     def _uniform(self) -> torch.Tensor:
         """Uniform random numbers [N, V] in (0, 1) from a counter-based hash (PCG's output function, on 32-bit
@@ -210,15 +225,15 @@ class Search:
             x = ((x >> 22) ^ x) & mask
         return (x.float() + 0.5) / 4294967296.0
 
-    def _greedy(self, logp: torch.Tensor) -> None:
+    def _greedy(self, logp: torch.Tensor, prompt: torch.Tensor) -> None:
         if self.mode == "sample":
             scaled = (logp / self.temperature).log_softmax(-1)
             u = self._uniform().clamp_(min=1e-20)
             token = (scaled - (-u.log()).log()).argmax(-1)  # Gumbel-max: a sample of softmax(logp / T)
         else:
             token = logp.argmax(-1)
-        t = self.t.repeat_interleave(self.K)  # [N]
-        live = ~self.row_done
+        t = self.t.repeat_interleave(self.K).clamp(min=0)  # [N]
+        live = ~self.row_done & ~prompt
         score = logp.gather(1, token[:, None])[:, 0]
         self.cum += torch.where(live, score, 0.0)
         eos = token == self.cfg.eot
@@ -226,18 +241,18 @@ class Search:
         keep = live & ~eos  # a generated token (EOS is not part of the hypothesis)
         self.hist.scatter_(1, t[:, None], torch.where(keep, token, self.hist.gather(1, t[:, None])[:, 0])[:, None])
         self.length += keep.long()
-        self.row_done |= eos | last
+        self.row_done |= (eos | last) & ~prompt
         self.done.copy_(self.row_done.view(self.B, self.K).all(1))
         self.tokens.copy_(token[:, None])
 
-    def _beam(self, logp: torch.Tensor) -> None:
+    def _beam(self, logp: torch.Tensor, prompt: torch.Tensor) -> None:
         B, K, V = self.B, self.K, self.cfg.vocab_size
         scores = (logp + self.cum[:, None]).view(B, K * V)
         top_s, top_i = scores.topk(2 * K, dim=1)  # [B, 2K], best first
         tok, par = top_i % V, top_i // V
         eos = tok == self.cfg.eot
         last = (self.t == self.max_new - 1)[:, None].expand(B, K)
-        live = ~self.done[:, None]
+        live = ~self.done[:, None] & ~prompt.view(B, K)[:, :1]
         finish = (eos[:, :K] | last) & live  # [B, K]: hypotheses registered this step
         # register them: slot count + rank, beyond the hypotheses' storage for the others
         rank = finish.long().cumsum(1) - 1
@@ -245,12 +260,13 @@ class Search:
         T = self.max_new  # the history buffer's length
         parent_hist = self.hist.view(B, K, T).gather(1, par[:, :K, None].expand(B, K, T))  # [B, K, T]
         with_token = (~eos[:, :K]).long()  # hypotheses ending without EOS (last step) keep their token
-        step = self.t.view(B, 1, 1).expand(B, K, 1)
+        t = self.t.clamp(min=0)
+        step = t.view(B, 1, 1).expand(B, K, 1)
         parent_hist = parent_hist.scatter(2, step, torch.where(with_token[..., None] > 0, tok[:, :K, None],
                                                                parent_hist.gather(2, step)))
         self.h_tokens.scatter_(1, slot[..., None].expand(B, K, T), parent_hist)
         self.h_score.scatter_(1, slot, top_s[:, :K])
-        self.h_len.scatter_(1, slot, self.t[:, None].expand(B, K) + with_token)
+        self.h_len.scatter_(1, slot, t[:, None].expand(B, K) + with_token)
         self.h_count += finish.long().sum(1)
         # each primary candidate that ended gives its place to the next secondary one that does not end
         sec_ok = ~eos[:, K:]  # [B, K]
@@ -266,7 +282,7 @@ class Search:
         # the new beams' histories and slot tables are their parents'
         rows = (new_par + torch.arange(B, device=tok.device)[:, None] * K).view(-1)  # [N] parent rows
         hist = self.hist.index_select(0, rows)
-        hist.scatter_(1, self.t.repeat_interleave(K)[:, None], new_tok.view(-1, 1))
+        hist.scatter_(1, t.repeat_interleave(K)[:, None], new_tok.view(-1, 1))
         self.hist.copy_(hist)
         self.cum.copy_(new_s.view(-1))
         self.tokens.copy_(new_tok.view(-1, 1))
@@ -274,32 +290,23 @@ class Search:
         self.src.copy_(self.src_scratch)
 
     # --- driver -----------------------------------------------------------------------------------------
-    def _start(self, slots: list[int], prompts: list[list[int]], prefill: Callable) -> torch.Tensor:
-        """Load windows into ``slots``: each prompt but its last token prefilled into the slot's rows (one call
-        for all slots at the first fill, else one per slot), the last one fed by the next step; returns the
-        windows' no-speech probabilities [len(slots)] (on the device)."""
+    def _start(self, slots: list[int], prompts: list[list[int]]) -> None:
+        """Load windows into ``slots``: their prompts are fed from the next step on (the slot's position 0, then
+        one token per step, see _choose). Only asynchronous writes from pinned memory: the queued steps go on."""
         K, P, dev = self.K, self.P, self.device
-        order = sorted(range(len(slots)), key=lambda i: slots[i])
-        no_speech = torch.empty(len(slots), device=dev)
-        i = 0
-        whole = sorted(slots) == list(range(self.B))  # the first fill: one call for all slots
-        while i < len(order):  # (refills: one call per slot, so that a Search needs at most B + 1 contexts)
-            j = len(order) if whole else i + 1
-            a, b = slots[order[i]], slots[order[j - 1]] + 1
-            rows = slice(a * K, b * K)
-            tokens = torch.tensor([prompts[order[k]][:-1] for k in range(i, j) for _ in range(K)], device=dev)
-            self.src[rows] = self.row_ids[rows]
-            logits = prefill(slice(a, b), tokens, self.cache[:, :, rows], self.src_local[: (b - a) * K])
-            sot = prompts[order[i]].index(self.cfg.sot)
-            p = logits[::K, sot].softmax(-1)[:, self.cfg.no_speech]
-            no_speech[torch.tensor(order[i:j], device=dev)] = p
-            i = j
-        s_idx = torch.tensor(slots, device=dev)
+
+        def to_dev(x) -> torch.Tensor:
+            return torch.tensor(x, dtype=torch.long, pin_memory=True).to(dev, non_blocking=True)
+
+        s_idx = to_dev(slots)
         r_idx = (s_idx[:, None] * K + torch.arange(K, device=dev)).view(-1)
-        last = torch.tensor([p[-1] for p in prompts], device=dev)
-        self.tokens[r_idx, 0] = last.repeat_interleave(K)
-        self.pos[s_idx] = P - 1
-        self.t[s_idx] = 0
+        prompt = to_dev([p + [0] for p in prompts])  # [n, P + 1] (a pad: the index past the prompt)
+        self.forced[s_idx] = prompt
+        self.sot_pos[s_idx] = to_dev([p.index(self.cfg.sot) for p in prompts])
+        self.tokens[r_idx, 0] = prompt[:, 0].repeat_interleave(K)
+        self.pos[s_idx] = 0
+        self.t[s_idx] = -(P - 1)
+        self.src[r_idx] = self.row_ids[r_idx]
         first = torch.arange(len(r_idx), device=dev) % K == 0  # only the first beam takes part in the first step
         self.cum[r_idx] = torch.where(first | (self.mode != "beam"), 0.0, float("-inf"))
         if self.mode == "beam":
@@ -310,13 +317,11 @@ class Search:
         self.length[r_idx] = 0
         self.row_done[r_idx] = False
         self.done[s_idx] = False
-        return no_speech
 
     def stream(
         self,
         prompts: list[list[int]],
         load: Callable[[list[int], list[int]], None],
-        prefill: Callable,
         suppress: list[int],
         begin_suppress: list[int],
         temperature: float = 1.0,
@@ -325,9 +330,7 @@ class Search:
     ) -> list[WindowResult]:
         """Decode len(prompts) windows (prompts of length P), at most B at a time: a slot whose window is done
         takes the next one. ``load(slots, windows)`` puts the windows' cross-attention keys/values into those
-        slots; ``prefill(slots, tokens [n*K, P-1], cache [L, 2, n*K, H, C, d_k], src [n*K, C])`` runs the
-        decoder over the tokens of the consecutive ``slots`` (a slice of n slots) into their rows of the cache
-        (positions 0..P-2) and returns their logits [n*K, P-1, V]."""
+        slots (on the current stream, before the next step)."""
         self.prepare()
         self.suppress.zero_()
         if suppress:
@@ -341,7 +344,6 @@ class Search:
         self.row_done.fill_(True)
         M = len(prompts)
         results: list[WindowResult | None] = [None] * M
-        no_speech: list = [None] * M
         window = [-1] * self.B  # the window in each slot
         nxt = 0
 
@@ -355,10 +357,9 @@ class Search:
             if not pairs:
                 return
             load([s for s, _ in pairs], [w for _, w in pairs])
-            ns = self._start([s for s, _ in pairs], [prompts[w] for _, w in pairs], prefill)
-            for k, (s, w) in enumerate(pairs):
+            self._start([s for s, _ in pairs], [prompts[w] for _, w in pairs])
+            for s, w in pairs:
                 window[s] = w
-                no_speech[w] = ns[k]
 
         fill(list(range(self.B)))
         while any(w >= 0 for w in window):
@@ -372,21 +373,20 @@ class Search:
                 results[window[s]] = r
                 window[s] = -1
             fill(finished)
-        for r, p in zip(results, torch.stack(no_speech).tolist()):
-            r.no_speech_prob = p
         return results
 
-    def run(self, prompt: torch.Tensor, prefill: Callable, suppress: list[int], begin_suppress: list[int],
-            temperature: float = 1.0, seed: int = 0, check_every: int = 4) -> list[WindowResult]:
+    def run(self, prompt: torch.Tensor, suppress: list[int], begin_suppress: list[int], temperature: float = 1.0,
+            seed: int = 0, check_every: int = 4) -> list[WindowResult]:
         """The B windows whose cross-attention keys/values are already in the slots (``prompt`` [B, P])."""
-        return self.stream(prompt.tolist(), lambda slots, windows: None, prefill, suppress, begin_suppress,
-                           temperature, seed, check_every)
+        return self.stream(prompt.tolist(), lambda slots, windows: None, suppress, begin_suppress, temperature,
+                           seed, check_every)
 
     def _collect(self, slots: list[int]) -> list[WindowResult]:
-        """The results of the windows in ``slots`` (all done); no-speech probabilities are filled in later."""
+        """The results of the windows in ``slots`` (all done)."""
         out = []
         K = self.K
         idx = torch.tensor(slots, device=self.device)
+        no_speech = self.no_speech[idx].tolist()
         if self.mode == "beam":
             count, score = self.h_count[idx].tolist(), self.h_score[idx].tolist()
             lengths, tokens = self.h_len[idx].tolist(), self.h_tokens[idx].tolist()
@@ -394,14 +394,14 @@ class Search:
                 hyps = [Hypothesis(tokens[j][i][: lengths[j][i]], score[j][i], lengths[j][i])
                         for i in range(min(count[j], 2 * K))]
                 best = max(hyps, key=lambda h: h.normalized)
-                out.append(WindowResult(best, 0.0, hyps, self.max_new))
+                out.append(WindowResult(best, no_speech[j], hyps, self.max_new))
             return out
         rows = torch.cat([torch.arange(s * K, (s + 1) * K) for s in slots]).to(self.device)
         hist, cum, length = self.hist[rows].tolist(), self.cum[rows].tolist(), self.length[rows].tolist()
         for j in range(len(slots)):
             hyps = [Hypothesis(hist[r][: length[r]], cum[r], length[r]) for r in range(j * K, (j + 1) * K)]
             best = max(hyps, key=lambda h: h.normalized)
-            out.append(WindowResult(best, 0.0, hyps, self.max_new))
+            out.append(WindowResult(best, no_speech[j], hyps, self.max_new))
         return out
 
 

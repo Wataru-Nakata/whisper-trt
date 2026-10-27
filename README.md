@@ -8,17 +8,17 @@ transformers.
 ```python
 from whisper_trt import Whisper
 
-model = Whisper.from_pretrained("openai/whisper-large-v3")   # first call builds TensorRT engines (~5 min, cached)
+model = Whisper.from_pretrained("openai/whisper-large-v3")   # first call builds TensorRT engines (~6 min, cached)
 
 # up-to-30 s windows, each decoded on its own as faster-whisper's generate_with_fallback decodes a window:
-# beam 5 at temperature 0, then best-of-5 sampling at 0.2 ... 1.0 for windows that fail its thresholds
-out = model.decode_windows(["a.wav", "b.wav"], language="ja", batch_size=8)
+# beam 5 at temperature 0, then best-of-5 sampling at 0.2 ... 1.0 for windows that fail its thresholds.
+# batch_size windows decode at a time; a finished window's slot takes the next one at once.
+out = model.decode_windows(["a.wav", "b.wav", ...], language="ja", batch_size=16)
 out[0].text, out[0].avg_logprob, out[0].no_speech_prob, out[0].compression_ratio, out[0].temperature
 
-# building blocks: features -> encoder -> CTranslate2-style generate / detect_language
-cross = model.encode(model.features(["a.wav", "b.wav"]))
-res = model.generate(cross, model.prompt("en"), beam_size=5)   # tokens, scores, no-speech probabilities
-model.detect_language(cross)                                   # [[("en", 0.99), ...], ...]
+# one pass, CTranslate2-style results (tokens, scores, no-speech probabilities)
+res = model.decode(["a.wav", "b.wav", ...], model.prompt("en"), beam_size=5, batch_size=32)
+model.detect_language(model.encode(model.features(["a.wav"])))   # [[("en", 0.99), ...]]
 ```
 
 ```bash
@@ -29,42 +29,60 @@ whisper-trt detect-language a.wav
 
 ## Speed
 
-One H200, `openai/whisper-large-v3`, fp16. RTFx: seconds of audio per second of encoder + decoding (ours also
-includes the log-Mel features; faster-whisper's are computed apart), best of 3 passes after a warm-up.
-"Identical": token sequences equal to faster-whisper's (CTranslate2 4.8.2) with the same options.
+One H200, `openai/whisper-large-v3`, fp16, the language forced, no timestamps, beam 5 (the first pass of
+a clip-transcription workload). RTFx: seconds of audio per second of features + encoder + decoding, best of two
+passes; faster-whisper 1.2.1 (CTranslate2 4.8.2, fp16) decodes batches of 8 windows as its batched pipeline does
+(encoder + generate, its features computed apart).
 
-LibriSpeech dev-clean, 73 utterances (481 s), English forced, no timestamps:
+| set | faster-whisper, batch 8 | **whisper-trt, 8 slots** | **16 slots** | **32 slots** |
+|---|---:|---:|---:|---:|
+| LibriSpeech test-clean (2620 utterances, 5.4 h) | 103 | **397** (3.9x) | **505** (4.9x) | **550** (5.3x) |
+| JVS parallel100 (1000 utterances, 2.2 h) | 99 | **332** (3.4x) | **443** (4.5x) | **491** (5.0x) |
+| YODAS v3 Japanese (300 web-audio windows, 2.1 h) | 154 | **501** (3.2x) | **743** (4.8x) | **874** (5.7x) |
+| YODAS v3 English (300 windows, 1.9 h) | 215 | **798** (3.7x) | **1060** (4.9x) | **1190** (5.5x) |
+| YODAS v3 Hindi (300 windows, 2.0 h) | 106 | **335** (3.2x) | **482** (4.5x) | **574** (5.4x) |
 
-| setup | faster-whisper fp16 | faster-whisper fp32 | **whisper-trt** | identical to fp32 / fp16 | WER |
-|---|---:|---:|---:|---:|---:|
-| greedy, batch 1 | 51.5 | 35.0 | **129.8** | 73/73 / 72/73 | 4.17% (all three) |
-| beam 5, batch 1 | 45.5 | 24.8 | **92.3** | 72/73 / 72/73 | 3.91% (all three) |
-| beam 5, batch 8 | 105.9 | 47.6 | **253.2** | 73/73 / 72/73 | 3.91% (all three) |
+Peak GPU memory 15 / 18 / 25 GiB at 8 / 16 / 32 slots. The engines take about 6 minutes to build on first use.
 
-The PyTorch backend in fp32 (`backend="torch", dtype="float32"`) gives faster-whisper's float32 tokens exactly:
-73/73 for greedy and beam 5, batch 1 and 8, scores within 4e-6, no-speech probabilities within 5e-6.
+Where the time goes (YODAS Japanese, 8 slots): 92% of the wall time in decoder steps (3.9 ms each for 40 rows,
+the encoder of the next windows running alongside on another stream), loading windows into slots 1%. A step is
+about 420 TensorRT kernels: it is bound by kernel latency, not by memory bandwidth (TensorRT's layer profiler at
+40 rows: GEMMs 40%, cross-attention 19%, fused LayerNorm/residual kernels 14%, GELU 9%, self-attention 8%).
 
-Up-to-30 s clips (consecutive utterances joined; 64 per language, 21.6-26.0 s on average), the language forced,
-no timestamps, beam 5: the first pass of a clip-transcription workload (faster-whisper's batched pipeline, batch 8):
+## Agreement with faster-whisper
 
-| clips | faster-whisper fp16, batch 8 | **whisper-trt, batch 8** | faster-whisper fp16, batch 16 | **whisper-trt, batch 16** | identical (batch 8) | WER / CER, batch 8: ours vs faster-whisper |
-|---|---:|---:|---:|---:|---:|---|
-| Japanese (JVS) | 161.5 | **379.4** | 224.4 | **532.1** | 59/64 | CER 5.78% vs 5.80% |
-| English (LibriSpeech test-clean) | 208.8 | **478.9** | 276.6 | **627.8** | 63/64 | WER 2.05% vs 1.64% |
-| German (FLEURS) | 193.7 | **419.1** | 260.8 | **554.7** | 64/64 | WER 4.59% vs 4.59% |
-| Mandarin (FLEURS) | 167.2 | **373.7** | 228.9 | **497.8** | 58/64 | CER 10.44% vs 10.61% |
+Measured window by window against faster-whisper fp16 (beam 5, batch 8), with the decisions its
+`generate_with_fallback` takes from a window's decode: silence (no-speech probability > 0.6 and average
+log-probability < -1), fallback (compression ratio > 2.4 or average log-probability < -1, not silence) and the
+224-token limit. YODAS v3 windows are web audio (music, noise, silence, several speakers) cut from the start of
+the first recordings of each language (`scripts/make_eval_yodas.py`: 30 s, or one in three of a random length),
+without VAD.
 
-2.1-2.4x faster-whisper at the same batch size, and 2.9-3.3x its batch 8 with batch 16. The English WER gap is
-one clip: whisper-trt's beam search ends before the clip's last sentence (47 instead of 65 tokens); the PyTorch
-fp16 backend with the same search gives faster-whisper's tokens on it (see Precision). Language identification:
-64/64 top-1 equal to CTranslate2's on the Japanese and English clips. With every window forced through the
-temperature fallback (`scripts/smoke_workload.py --force-fallback`), 64 Japanese windows decode six times each
-(beam 5, then best-of-5 sampling at 0.2 ... 1.0) at RTFx 52.
+* **Exactness.** In fp32 (`backend="torch", dtype="float32"`), whisper-trt gives faster-whisper fp32's tokens on
+  every window: 300/300 for YODAS Japanese, English, German, Hindi, Tamil and Greek each (1800 windows; scores
+  within 1.4e-5; Hindi and Tamil have about 110 windows each at the token limit and 60-170 needing the fallback),
+  and 73/73 on LibriSpeech dev-clean for greedy and beam 5. The search, the refills and the decisions are
+  faster-whisper's.
+* **fp16** (the TensorRT engines; 8 and 32 slots give the same agreement within 0.7 points):
 
-Where the time goes (beam 5, batch 8, English clips): encoder 45 ms per batch of 8 windows (12%), decoding
-the rest, at 3.5 ms per decoder step for 40 rows (TensorRT's layer profiler: GEMMs 40%, cross-attention 19%,
-fused LayerNorm/residual kernels 14%, GELU 9%, self-attention 8%). At batch 1 (greedy) a step takes 1.95 ms. Steps are
-bound by kernel latency (about 420 TensorRT kernels each), not by memory bandwidth.
+| set | windows | identical tokens | WER / CER: whisper-trt vs faster-whisper | decisions agree |
+|---|---:|---:|---|---:|
+| LibriSpeech test-clean | 2620 | 99.3% | WER 2.78% vs 2.77% | 100% |
+| JVS parallel100 | 1000 | 98.9% | CER 6.14% vs 6.11% | 100% |
+| FLEURS de / es / ru / fr / en | 862 / 908 / 356 / 289 / 394 | 98.7-99.7% | WER within 0.05 | 100% |
+| FLEURS Mandarin / Japanese | 945 / 266 | 97.7% / 98.5% | CER 8.20% vs 8.20% / 3.74% vs 3.78% | 100% |
+| YODAS, 18 languages | 5400 | 73.7% (ta) - 97.3% (pt), 90.3% overall | caption CER 33.85% vs 33.89% | 97.7-100% |
+
+  On web audio fp16 decodes differ more often, from faster-whisper's own fp32 decodes too: faster-whisper fp16
+  and fp32 give the same tokens on 94.0% / 99.0% / 83.3% of the YODAS ja / en / ta windows, whisper-trt fp16 and
+  faster-whisper fp32 on 92.7% / 96.7% / 78.0% (`scripts/ct2_vs_ct2.py`, `parity.py`). Long decodes (Tamil,
+  Hindi, Thai, near the token limit) diverge most: one near-tie early on changes the rest. The quality is the
+  same: against the videos' own captions (the caption segments whose midpoint falls in a window; an approximate
+  reference, the same for both), the character error rate over the 5076 YODAS windows with captions is 33.85%
+  for whisper-trt and 33.89% for faster-whisper, within 0.7 points in every language
+  (`scripts/yodas_captions.py`). Language identification: top-1 equal to CTranslate2's on 64/64 Japanese and
+  English clips. With every window forced through the temperature fallback (`scripts/smoke_workload.py
+  --force-fallback`), 64 Japanese clips decode six times each (beam 5, then best-of-5 sampling) at RTFx 57.
 
 ## How it works
 
@@ -81,8 +99,13 @@ bound by kernel latency (about 420 TensorRT kernels each), not by memory bandwid
   no-speech probability from the logits at `<|startoftranscript|>`; language identification from the
   language tokens' logits after `<|startoftranscript|>` (64/64 top-1 equal to CTranslate2's on Japanese and
   English clips, probabilities within 2e-3).
-* **Static buffers and CUDA graphs.** Every decoding step (decoder call, token choice) runs on fixed buffers and
-  is one CUDA-graph replay; the host checks for the end every 4 steps.
+* **Slots, refilled.** `decode` keeps `batch_size` windows decoding in slots of K rows (K beams). Every slot
+  has its own position, so one captured CUDA graph per step serves windows at any point of their decode; every
+  4 steps the host takes the results of the finished windows and loads the next windows into their slots. A
+  window's prompt tokens are forced tokens of its first steps (no prefill call), and its no-speech probability
+  is taken inside the graph, so a load is a few asynchronous writes. The next windows' features and encoder run
+  ahead on a lower-priority stream (with TensorRT contexts of their own) and are copied into a slot when it
+  frees up. No window waits for the slowest of a batch (+22% on LibriSpeech dev-clean at 8 slots).
 * **Beam search never moves the KV cache.** Each row has a table of the row whose cache holds each of its
   slots; a new beam takes its parent's table (a few KB) instead of copying the parent's cache (hundreds of MB
   per step at 8 windows x 5 beams). A window's beams share its cross-attention keys/values: their queries are
@@ -93,15 +116,21 @@ bound by kernel latency (about 420 TensorRT kernels each), not by memory bandwid
   CTranslate2's (curand), so sampled decodes agree with faster-whisper in distribution only.
 * **TensorRT engines are built on first use**: the encoder (with every decoder layer's cross-attention
   projection) and the decoder call are exported to ONNX and compiled into strongly-typed fp16 engines, cached
-  under `~/.cache/whisper_trt` (`WHISPER_TRT_CACHE` moves them). Decoder self- and cross-attention are Triton
-  kernels compiled into the engine as TensorRT plugins (after owsm-trt's): self-attention reads the KV cache
-  through the slot table, so the cache needs no length buckets; cross-attention is split over 8 slices of the
-  1500 keys ("flash-decoding"), which gives one window 160 programs instead of 20 (batch-1 step 2.4 -> 2.0 ms).
+  under `~/.cache/whisper_trt` (`WHISPER_TRT_CACHE` moves them). Triton kernels are compiled into the decoder
+  engine as TensorRT plugins (after owsm-trt's): self-attention reads the KV cache through the slot table (so the
+  cache needs no length buckets); cross-attention is split over 8 slices of the 1500 keys ("flash-decoding"),
+  which gives one window 160 programs instead of 20 (batch-1 step 2.4 -> 2.0 ms); the vocabulary projection
+  accumulates in fp32 (below).
 * **Precision.** LayerNorm and the MLPs' GELU are computed in fp32 inside the fp16 engines: TensorRT's fp16 GELU
-  multiplied the encoder's error by 5 (`scripts/encoder_variants.py`). TensorRT's fp16 GEMMs are still 3-9x
-  less precise than PyTorch's (`scripts/op_precision.py`; TensorRT 11 has no setting for their accumulation),
-  which is where the remaining differences from faster-whisper come from: on two English clips where whisper-trt
-  differs from faster-whisper, the PyTorch fp16 backend with the same search gives faster-whisper's tokens.
+  multiplied the encoder's error by 5 (`scripts/encoder_variants.py`). TensorRT's fp16 GEMMs accumulate less
+  precisely than cuBLAS's (3-9x the error, `scripts/op_precision.py`; TensorRT 11 has no setting for it), and the
+  decoder is what this moves: with the PyTorch fp16 decoder behind the TensorRT encoder, YODAS ja / ta agreement
+  with faster-whisper fp32 is 283 / 252 of 300, against 264 / 214 with both from TensorRT
+  (`scripts/hybrid_agree.py`). The vocabulary projection, which decides beam ties, is therefore a Triton GEMM
+  plugin with fp16 inputs and fp32 accumulation: 766 -> 802 of 900 YODAS ja / ta / en windows equal to
+  faster-whisper fp32 (faster-whisper fp16 itself: 829), at no step cost from 8 slots on. The PyTorch decoder with
+  the same Triton attention kernels (`TorchBackend(kernels=True)`) would be 15-35% slower per step at 40-160 rows
+  (`scripts/bench_decoder.py`).
 
 ## Limitations
 
@@ -110,7 +139,6 @@ bound by kernel latency (about 420 TensorRT kernels each), not by memory bandwid
   faster-whisper's batched pipeline decodes clips.
 * Every input is one window of at most 30 s: longer audio is trimmed, not chunked (features are normalized
   over the whole input, as faster-whisper normalizes a clip).
-* A batch of windows decodes until its slowest window is done (no refilling of finished rows yet).
 * Tested with torch 2.14.1 (CUDA 13) + TensorRT 11.4.0.106 on H200 only.
 
 ## Development
@@ -127,7 +155,11 @@ snapshot of the code. `scripts/build_env_tar.sh` builds them (from `uv.lock`):
 * `scripts/make_clips.py`: up-to-30 s clips from consecutive utterances (multilingual benchmarks).
 * `scripts/smoke_workload.py`: language identification and `decode_windows` (with `--force-fallback`, every
   window through every temperature) on clips.
-* `scripts/profile_decode.py`, `scripts/trt_profile.py`: time per stage / per TensorRT layer.
+* `scripts/make_eval_yodas.py`, `scripts/prepare_waves.py`: the evaluation sets (`.cache/eval`);
+  `scripts/mismatch_summary.py`, `scripts/ct2_vs_ct2.py`, `scripts/yodas_captions.py`: their analysis.
+* `scripts/profile_stream.py`, `scripts/profile_decode.py`, `scripts/trt_profile.py`, `scripts/bench_decoder.py`:
+  time per part of a streamed decode / per stage / per TensorRT layer / per decoder step.
 * `scripts/check_engines.py`, `scripts/encoder_variants.py`, `scripts/op_precision.py`,
   `scripts/teacher_force.py`, `scripts/search_debug.py`: component-level checks of the engines.
-* `pytest tests`: search against CTranslate2's loops, sampling, attention kernels (GPU tests skip on CPU).
+* `pytest tests`: search against CTranslate2's loops (refilled slots included), sampling, the Triton kernels (GPU
+  tests skip on CPU).

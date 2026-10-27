@@ -133,7 +133,7 @@ class Whisper:
             new_kv = torch.zeros(c.dec_layers, 2, n, c.dec_heads, p, c.head_dim, dtype=self.backend.dtype,
                                  device=self.device)
             fn = self.backend.step_fn(tokens, offset, cache, logits, new_kv, src, cross=self.cross(windows))
-            self._prefills[key] = (fn, tokens, logits, new_kv)
+            self._prefills[key] = (fn, tokens, logits, new_kv)  # (fn keeps every bound tensor alive)
         fn, tokens, logits, new_kv = self._prefills[key]
         tokens.copy_(rows)
         fn()

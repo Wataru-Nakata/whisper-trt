@@ -22,6 +22,7 @@ has a table ``src`` [N, C] of the row whose cache holds each of its slots (attn_
 takes its parent's table, and the token it is fed next is written to its own row's slot.
 """
 
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -98,7 +99,7 @@ class Search:
         dtype: torch.dtype = torch.float16,
         device: str | torch.device = "cuda",
         max_length: int = 448,
-        graphs: bool = True,
+        graphs: bool | None = None,
     ):
         if mode not in ("beam", "greedy", "sample"):
             raise ValueError(f"unknown search mode {mode!r}")
@@ -114,7 +115,8 @@ class Search:
         N, B, K, T = self.N, self.B, self.K, self.max_new
         dev = self.device
         self.step_fn = step_fn
-        self.graphs = graphs
+        # CUDA graphs: on unless WHISPER_TRT_GRAPHS=0 (for debugging)
+        self.graphs = graphs if graphs is not None else os.environ.get("WHISPER_TRT_GRAPHS", "1") != "0"
         # self-attention cache: one flat buffer, laid out [L, 2, N, H, C, d_k] for the current bucket C
         self.cache_flat = torch.zeros(L * 2 * N * H * self.capacity * dk, dtype=dtype, device=dev)
         self.src_flat = torch.zeros(N * self.capacity, dtype=torch.int32, device=dev)

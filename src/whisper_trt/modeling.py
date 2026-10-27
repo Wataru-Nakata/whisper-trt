@@ -73,7 +73,22 @@ def attend(
     scores = (q * q.shape[-1] ** -0.5) @ k.transpose(-1, -2)
     if mask is not None:
         scores = scores.masked_fill(~mask, float("-inf"))
+    if Precision.softmax32:
+        return scores.float().softmax(-1).to(v.dtype) @ v
     return scores.softmax(-1) @ v
+
+
+class Precision:
+    """Export options: parts of the fp16 graph computed in fp32 (TensorRT keeps the types it is given)."""
+
+    softmax32 = False  # attention probabilities
+    # The MLPs' GELU: TensorRT's fp16 erf multiplied the encoder's error by 5 (scripts/encoder_variants.py)
+    gelu32 = True
+    residual32 = False  # the encoder's residual stream
+
+
+def gelu(x: torch.Tensor) -> torch.Tensor:
+    return F.gelu(x.float()).to(x.dtype) if Precision.gelu32 else F.gelu(x)
 
 
 class EncoderLayer(nn.Module):
@@ -86,11 +101,12 @@ class EncoderLayer(nn.Module):
         self.final_layer_norm = LayerNorm(d)
 
     def mlp(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fc2(F.gelu(self.fc1(x)))
+        return self.fc2(gelu(self.fc1(x)))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.self_attn(self.self_attn_layer_norm(x))
-        return x + self.mlp(self.final_layer_norm(x))
+        dt = self.fc1.weight.dtype  # (x is fp32 with an fp32 residual stream)
+        x = x + self.self_attn(self.self_attn_layer_norm(x).to(dt)).to(x.dtype)
+        return x + self.mlp(self.final_layer_norm(x).to(dt)).to(x.dtype)
 
 
 class Encoder(nn.Module):
@@ -105,12 +121,15 @@ class Encoder(nn.Module):
 
     def forward(self, feats: torch.Tensor) -> torch.Tensor:
         """feats [B, n_mels, 3000] -> [B, 1500, d]"""
-        x = F.gelu(self.conv1(feats.to(self.conv1.weight.dtype)))
-        x = F.gelu(self.conv2(x)).transpose(1, 2)
+        dt = self.conv1.weight.dtype
+        x = gelu(self.conv1(feats.to(dt)))
+        x = gelu(self.conv2(x)).transpose(1, 2)
         x = x + self.embed_positions.weight[: x.shape[1]]
+        if Precision.residual32:
+            x = x.float()
         for layer in self.layers:
             x = layer(x)
-        return self.layer_norm(x)
+        return self.layer_norm(x).to(dt)
 
 
 class DecoderLayer(nn.Module):
@@ -125,7 +144,7 @@ class DecoderLayer(nn.Module):
         self.final_layer_norm = LayerNorm(d)
 
     def mlp(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fc2(F.gelu(self.fc1(x)))
+        return self.fc2(gelu(self.fc1(x)))
 
 
 class Decoder(nn.Module):

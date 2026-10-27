@@ -141,8 +141,10 @@ class TRTBackend:
         if i not in self._enc_ctxs:
             self._enc_ctxs[i] = self._context(self.encoder, i)
         ctx = self._enc_ctxs[i]
-        self._bind(ctx, "feats", feats.contiguous(), True)
+        feats = feats.contiguous()
+        self._bind(ctx, "feats", feats, True)
         self._bind(ctx, "cross_kv", cross, False)
+        _check_outputs(ctx, {"cross_kv": cross})
         self._execute(ctx, "encoder")
 
     def step_fn(
@@ -168,11 +170,14 @@ class TRTBackend:
             self._bind(ctx, f"cross_v_{i}", cross[i, 1], True)
         self._bind(ctx, "logits", logits, False)
         self._bind(ctx, "new_kv", new_kv, False)
+        _check_outputs(ctx, {"logits": logits, "new_kv": new_kv})
 
         def run() -> None:
             self._execute(ctx, kind)
 
-        run.ctx = ctx  # keep the context alive as long as the closure
+        # The context holds raw pointers: the closure keeps it and every bound tensor alive (a dropped
+        # `offset` once let torch reuse its memory, and every later prefill read garbage offsets).
+        run.keep = (ctx, tokens, offset, cache, logits, new_kv, src, cross)
         return run
 
     def _decoder_profile(self, rows: int, seq: int) -> int:
@@ -181,3 +186,12 @@ class TRTBackend:
                 return i
         raise ValueError(f"no decoder profile covers {rows} rows x {seq} tokens")
 
+
+def _check_outputs(ctx, outputs: dict[str, torch.Tensor]) -> None:
+    """The output shapes the context will write, against the buffers bound to them (a bigger output would
+    overwrite whatever follows the buffer)."""
+    ctx.infer_shapes()
+    for name, t in outputs.items():
+        shape = tuple(ctx.get_tensor_shape(name))
+        if shape != tuple(t.shape):
+            raise ValueError(f"the engine writes {name} as {shape}, its buffer is {tuple(t.shape)}")

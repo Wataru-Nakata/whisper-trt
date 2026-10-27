@@ -32,7 +32,7 @@ from .search import cache_buckets
 log = logging.getLogger(__name__)
 
 # Bump whenever the exported graphs change, so that cached engines of older exports are not reused.
-EXPORT_VERSION = 2
+EXPORT_VERSION = 3
 DTYPES = {"float16": torch.float16, "bfloat16": torch.bfloat16}
 
 

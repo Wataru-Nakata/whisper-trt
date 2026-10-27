@@ -123,6 +123,8 @@ class Search:
         self.cache = torch.zeros(L, 2, N, H, C, dk, dtype=dtype, device=dev)
         self.src = torch.zeros(N, C, dtype=torch.int32, device=dev)
         self.src_scratch = torch.zeros_like(self.src)
+        # a prefill's table: the slots of its own rows, numbered from its first row (the call sees only them)
+        self.src_local = torch.arange(N, dtype=torch.int32, device=dev)[:, None].repeat(1, C)
         self.row_ids = torch.arange(N, dtype=torch.int32, device=dev)[:, None]
         self.row_ar = torch.arange(N, device=dev)
         self.tokens = torch.zeros(N, 1, dtype=torch.long, device=dev)
@@ -287,7 +289,7 @@ class Search:
             rows = slice(a * K, b * K)
             tokens = torch.tensor([prompts[order[k]][:-1] for k in range(i, j) for _ in range(K)], device=dev)
             self.src[rows] = self.row_ids[rows]
-            logits = prefill(slice(a, b), tokens, self.cache[:, :, rows], self.src[rows])  # [n*K, P-1, V]
+            logits = prefill(slice(a, b), tokens, self.cache[:, :, rows], self.src_local[: (b - a) * K])
             sot = prompts[order[i]].index(self.cfg.sot)
             p = logits[::K, sot].softmax(-1)[:, self.cfg.no_speech]
             no_speech[torch.tensor(order[i:j], device=dev)] = p

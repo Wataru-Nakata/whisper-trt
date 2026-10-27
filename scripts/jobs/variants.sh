@@ -1,3 +1,4 @@
+# (development record: the paths are outputs of earlier jobs in this checkout)
 # Engine variants: transcript agreement (LibriSpeech 73 vs faster-whisper) and decoder step time.
 set -uo pipefail
 echo "=== pytest"; $PY -m pytest -q tests 2>&1 | tail -5

@@ -1,3 +1,4 @@
+# (development record: the paths are outputs of earlier jobs in this checkout)
 set -uo pipefail
 echo "=== smoke ja (forced fallback)"; $PY scripts/smoke_workload.py /groups/gai51740/acc12576tt/github.com/whisper_trt/outputs/job-2778453/clips-ja.npz /groups/gai51740/acc12576tt/github.com/whisper_trt/outputs/job-2778453/ref-ja.json --lang ja --force-fallback 2>&1 | grep -v "hidden args"
 echo "=== smoke en (torch fp16 for clips 30, 52)"; $PY scripts/smoke_workload.py /groups/gai51740/acc12576tt/github.com/whisper_trt/outputs/job-2778453/clips-en.npz /groups/gai51740/acc12576tt/github.com/whisper_trt/outputs/job-2778453/ref-en.json --lang en --torch16 30 52 2>&1 | grep -v "hidden args"

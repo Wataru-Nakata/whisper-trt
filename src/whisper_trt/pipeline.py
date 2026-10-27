@@ -43,12 +43,18 @@ class Decoded:
 
 
 def _on_stream(fn):
-    """Run a method's GPU work on the model's own stream (TensorRT synchronizes extra on the default one)."""
+    """Run a method's GPU work on the model's own stream (TensorRT synchronizes extra on the default one),
+    ordered after the caller's work on its stream, and the caller's later work after it (the returned tensors
+    are written on the model's stream)."""
 
     @functools.wraps(fn)
     def wrapper(self, *args, **kwargs):
+        outer = torch.cuda.current_stream()
+        self.stream.wait_stream(outer)  # inputs the caller produced
         with torch.cuda.stream(self.stream):
-            return fn(self, *args, **kwargs)
+            result = fn(self, *args, **kwargs)
+        outer.wait_stream(self.stream)  # results the caller will read
+        return result
 
     return wrapper
 

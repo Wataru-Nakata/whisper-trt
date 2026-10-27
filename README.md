@@ -108,6 +108,8 @@ bound by kernel latency (about 420 TensorRT kernels each), not by memory bandwid
 * Decoding with timestamps (and so `transcribe`-style long-form decoding and word timestamps), prompts with
   previous text and `initial_prompt` are not implemented yet; windows are decoded on their own, as
   faster-whisper's batched pipeline decodes clips.
+* Every input is one window of at most 30 s: longer audio is trimmed, not chunked (features are normalized
+  over the whole input, as faster-whisper normalizes a clip).
 * A batch of windows decodes until its slowest window is done (no refilling of finished rows yet).
 * Tested with torch 2.14.1 (CUDA 13) + TensorRT 11.4.0.106 on H200 only.
 

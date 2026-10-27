@@ -1,3 +1,4 @@
+# (development record: the paths are outputs of earlier jobs in this checkout)
 set -uo pipefail
 echo "=== pytest"; $PY -m pytest -q tests 2>&1 | tail -3
 P=/groups/gai51740/acc12576tt/github.com/whisper_trt/outputs/job-2778453

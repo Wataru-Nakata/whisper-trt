@@ -23,6 +23,7 @@ log = logging.getLogger(__name__)
 
 class TorchBackend:
     name = "torch"
+    buckets = True  # cache length buckets help (attention reads the whole cache)
 
     def __init__(self, model: WhisperModel):
         self.model = model
@@ -90,7 +91,10 @@ class TRTBackend:
         self.runtime = trt.Runtime(self.logger)
         self.encoder = self._load(engine_dir / "encoder.engine")
         self.decoder = self._load(engine_dir / "decoder.engine")
-        self.profiles = json.loads((engine_dir / "build.json").read_text())["profiles"]
+        meta = json.loads((engine_dir / "build.json").read_text())
+        self.profiles = meta["profiles"]
+        # the attention plugins read only the cache slots below the offset: no cache length buckets needed
+        self.buckets = not meta.get("attn_plugin", False)
         self._scratch: dict[int, torch.Tensor] = {}
         self._enc_ctxs: dict[int, object] = {}
 

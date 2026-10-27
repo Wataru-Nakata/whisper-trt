@@ -25,14 +25,14 @@ from torch import nn
 
 from . import attn_plugin
 from .config import N_FRAMES, WhisperConfig
-from .modeling import Attention, WhisperModel, load_model
+from .modeling import Attention, Precision, WhisperModel, load_model
 from .runtime import trt_logger
 from .search import cache_buckets
 
 log = logging.getLogger(__name__)
 
 # Bump whenever the exported graphs change, so that cached engines of older exports are not reused.
-EXPORT_VERSION = 3
+EXPORT_VERSION = 4
 DTYPES = {"float16": torch.float16, "bfloat16": torch.bfloat16}
 
 
@@ -46,6 +46,13 @@ class BuildOptions:
     workspace_gb: float = 8.0
     opt_level: int = 3
     attn_plugin: bool = True  # decoder attention as Triton plugins (needs Triton at build time only)
+    # cross-attention split over the keys (attn_plugin.cross_attn_split): 8 times as many programs
+    cross_split: bool = True
+    decoder_opt_level: int = 3  # TensorRT builder optimization level of the decoder engine
+    # parts of the fp16 graphs computed in fp32 (modeling.Precision)
+    ln32: bool = True
+    gelu32_encoder: bool = True
+    gelu32_decoder: bool = True
 
 
 class _EncoderGraph(nn.Module):
@@ -90,6 +97,16 @@ def _quiet_exporter():
 
 
 @contextmanager
+def _precision(ln32: bool, gelu32: bool):
+    saved = Precision.ln32, Precision.gelu32
+    Precision.ln32, Precision.gelu32 = ln32, gelu32
+    try:
+        yield
+    finally:
+        Precision.ln32, Precision.gelu32 = saved
+
+
+@contextmanager
 def _explicit_attention():
     Attention.explicit = True  # the scale on the query (see modeling.attend)
     try:
@@ -104,7 +121,7 @@ def export_encoder_onnx(model: WhisperModel, path: Path, opts: BuildOptions) -> 
     dev = next(model.parameters()).device
     batch = torch.export.Dim("batch", min=1, max=opts.max_batch)
     feats = torch.randn(2, cfg.n_mels, N_FRAMES, device=dev)
-    with _explicit_attention(), _quiet_exporter():
+    with _explicit_attention(), _precision(opts.ln32, opts.gelu32_encoder), _quiet_exporter():
         torch.onnx.export(
             _EncoderGraph(model).eval(),
             (feats,),
@@ -142,9 +159,11 @@ def export_decoder_onnx(model: WhisperModel, path: Path, opts: BuildOptions, plu
     if plugins:
         for layer in model.decoder.layers:
             layer.self_attn.fuse_qkv()
-    model.decoder.plugins = frozenset({"self", "cross"} if plugins else ())
+    model.decoder.plugins = frozenset(
+        ({"self", "cross"} | ({"cross_split"} if opts.cross_split else set())) if plugins else ()
+    )
     try:
-        with _explicit_attention(), _quiet_exporter():
+        with _explicit_attention(), _precision(opts.ln32, opts.gelu32_decoder), _quiet_exporter():
             torch.onnx.export(
                 _DecoderGraph(model).eval(),
                 (tokens, offset, src, *caches),
@@ -165,7 +184,9 @@ def export_decoder_onnx(model: WhisperModel, path: Path, opts: BuildOptions, plu
     return path
 
 
-def _build(onnx_path: Path, engine_path: Path, profiles: list[dict], opts: BuildOptions) -> None:
+def _build(
+    onnx_path: Path, engine_path: Path, profiles: list[dict], opts: BuildOptions, opt_level: int | None = None
+) -> None:
     import tensorrt as trt
 
     logger = trt_logger(trt)
@@ -180,7 +201,7 @@ def _build(onnx_path: Path, engine_path: Path, profiles: list[dict], opts: Build
         raise RuntimeError(f"failed to parse {onnx_path}:\n{errors}")
     config = builder.create_builder_config()
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, int(opts.workspace_gb * (1 << 30)))
-    config.builder_optimization_level = opts.opt_level
+    config.builder_optimization_level = opts.opt_level if opt_level is None else opt_level
     config.profiling_verbosity = trt.ProfilingVerbosity.DETAILED  # layer names for profiling; no runtime cost
     dynamic = {
         network.get_input(i).name for i in range(network.num_inputs) if -1 in tuple(network.get_input(i).shape)
@@ -247,7 +268,8 @@ def build_engines(model: WhisperModel, engine_dir: Path, opts: BuildOptions, kee
     _build(enc_onnx, engine_dir / "encoder.engine",
            [{"feats": tuple((n, cfg.n_mels, N_FRAMES) for n in p["batch"])} for p in enc], opts)
     dec = decoder_profiles(opts)
-    _build(dec_onnx, engine_dir / "decoder.engine", [decoder_profile_shapes(cfg, opts, p) for p in dec], opts)
+    _build(dec_onnx, engine_dir / "decoder.engine", [decoder_profile_shapes(cfg, opts, p) for p in dec], opts,
+           opts.decoder_opt_level)
     meta = {"options": asdict(opts), "config": asdict(cfg), "profiles": {"encoder": enc, "decoder": dec},
             "attn_plugin": plugins}
     (engine_dir / "build.json").write_text(json.dumps(meta, indent=1))

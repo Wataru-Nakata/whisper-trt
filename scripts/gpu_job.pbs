@@ -3,7 +3,7 @@
 #   scripts/qsub_pool.sh "CMD=scripts/parity.py --out @" [walltime]
 # CMD is a python script (relative to the repo) and its arguments; '@' stands for this job's output dir and
 # '~' for a space (qsub -v splits its list at commas and is unreliable with spaces).
-# REF_CMD (optional) runs first in the faster-whisper venv (the reference implementation).
+# REF_CMD (optional) runs first in the faster-whisper reference env (.cache/envs/fw-ref.tar.zst, unpacked locally).
 # A CMD ending in .sh runs with bash, with $PY (this env's python), $REF_PY (the reference venv's) and $OUT set.
 #PBS -l walltime=01:00:00
 #PBS -j oe
@@ -32,10 +32,24 @@ nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv -l 5 >
 SMI=$!
 trap 'kill $SMI 2>/dev/null || true' EXIT
 
-# CTranslate2 finds cuBLAS/cuDNN (CUDA 12) in the venv's nvidia packages through LD_LIBRARY_PATH
-REF_VENV=.cache/fw-ref-venv
-REF_LIBS=$(ls -d "$REF_VENV"/lib/python3.12/site-packages/nvidia/*/lib | paste -sd:)
-REF_PY="env LD_LIBRARY_PATH=$REF_LIBS $REF_VENV/bin/python"
+ZSTD="$(command -v zstd || echo "$HOME/miniconda3/bin/zstd")"
+unpack() {  # unpack <tar.zst>: a prebuilt env (scripts/build_env_tar.sh) onto node-local disk (Lustre is slow)
+  local t0=$SECONDS
+  "$ZSTD" -dc -T0 "$1" | tar -xf - -C "$PBS_LOCALDIR"
+  echo "unpacked $(basename "$1") in $((SECONDS - t0))s"
+}
+# The reference (faster-whisper / CTranslate2) env; CTranslate2 finds cuBLAS/cuDNN (CUDA 12) in its nvidia packages.
+REF_TAR="${REF_TAR:-$REPO/.cache/envs/fw-ref.tar.zst}"
+if [[ -n "$REF_CMD" || "$CMD" == *.sh* ]] && [ -f "$REF_TAR" ]; then
+  unpack "$REF_TAR"
+  REF_VENV=$PBS_LOCALDIR/fw-ref
+  REF_BIN=$REF_VENV/bin/python3
+else  # (before the tar exists: a venv on /groups)
+  REF_VENV=.cache/fw-ref-venv
+  REF_BIN=$REF_VENV/bin/python
+fi
+REF_LIBS=$(ls -d "$REF_VENV"/lib/python3.12/site-packages/nvidia/*/lib 2>/dev/null | paste -sd:)
+REF_PY="env LD_LIBRARY_PATH=$REF_LIBS $REF_BIN"
 if [ -n "${REF_CMD:-}" ]; then
   echo "=== reference: $REF_CMD"
   # shellcheck disable=SC2086
@@ -43,13 +57,13 @@ if [ -n "${REF_CMD:-}" ]; then
 fi
 
 if [ -n "${CMD:-}" ]; then
-  # Unpack the prebuilt env onto node-local disk: running torch/TensorRT from Lustre is slow.
-  ENV_TAR="${ENV_TAR:-/groups/gai51740/acc12576tt/github.com/owsm_trt/.cache/envs/owsm-env.tar.zst}"
-  ZSTD="$(command -v zstd || echo "$HOME/miniconda3/bin/zstd")"
-  t0=$SECONDS
-  "$ZSTD" -dc -T0 "$ENV_TAR" | tar -xf - -C "$PBS_LOCALDIR"
-  echo "unpacked $(basename "$ENV_TAR") in $((SECONDS - t0))s"
-  PYARR=(env -u CONDA_PREFIX PYTHONPATH="$SNAP/src:$SNAP:$REPO/.cache/extra-site" "$PBS_LOCALDIR/owsm-env/bin/python3")
+  ENV_TAR="${ENV_TAR:-$REPO/.cache/envs/whisper-env.tar.zst}"
+  [ -f "$ENV_TAR" ] || ENV_TAR=/groups/gai51740/acc12576tt/github.com/owsm_trt/.cache/envs/owsm-env.tar.zst
+  unpack "$ENV_TAR"
+  ENV_DIR=$PBS_LOCALDIR/$(basename "$ENV_TAR" .tar.zst)
+  EXTRA=""  # owsm's env lacks tokenizers/safetensors
+  [[ "$ENV_TAR" == *owsm-env* ]] && EXTRA=":$REPO/.cache/extra-site"
+  PYARR=(env -u CONDA_PREFIX PYTHONPATH="$SNAP/src:$SNAP$EXTRA" "$ENV_DIR/bin/python3")
   nvidia-smi
   echo "=== $CMD"
   if [[ "$CMD" == *.sh* ]]; then

@@ -46,11 +46,20 @@ def wer(hyps: list[str], refs: list[str]) -> float:
     return errors / max(1, sum(len(UNITS(r)) for r in refs))
 
 
+def build_options(items: list[str]) -> dict:
+    out = {}
+    for item in items:
+        k, v = item.split("=", 1)
+        out[k] = v.lower() == "true" if v.lower() in ("true", "false") else int(v)
+    return out
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("waves")
     ap.add_argument("ref")
     ap.add_argument("--model", default="openai/whisper-large-v3")
+    ap.add_argument("--build", nargs="*", default=[], help="engine build options KEY=VALUE (build.BuildOptions)")
     ap.add_argument("--backend", default="tensorrt")
     ap.add_argument("--dtype", default="float16")
     ap.add_argument("--lang", default="en")
@@ -69,7 +78,7 @@ def main() -> None:
     audio_s = sum(len(w) for w in waves) / 16000
     ref = json.load(open(args.ref))
     t0 = time.perf_counter()
-    model = Whisper.from_pretrained(args.model, backend=args.backend, dtype=args.dtype)
+    model = Whisper.from_pretrained(args.model, backend=args.backend, dtype=args.dtype, **build_options(args.build))
     print(f"loaded {args.backend}/{args.dtype} in {time.perf_counter() - t0:.1f}s", flush=True)
 
     feats_path = Path(args.ref.replace(".json", "-features.npz"))

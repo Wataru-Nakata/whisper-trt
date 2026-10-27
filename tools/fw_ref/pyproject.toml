@@ -1,0 +1,13 @@
+# The reference implementation (faster-whisper / CTranslate2, pinned), for
+# scripts/ref_ct2.py only; never a dependency of whisper-trt. Packed by `scripts/build_env_tar.sh ref`.
+[project]
+name = "whisper-trt-fw-ref"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "faster-whisper==1.2.1",
+    "ctranslate2==4.8.2",
+    "nvidia-cublas-cu12==12.9.2.10",
+    "nvidia-cudnn-cu12==9.26.0.51",
+    "numpy",
+]

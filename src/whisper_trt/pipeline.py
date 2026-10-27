@@ -76,6 +76,7 @@ class Whisper:
         max_batch: int = 16,
         max_rows: int = 80,
         cache_dir: str | None = None,
+        **build_options,
     ) -> "Whisper":
         model_dir = hub.resolve(name)
         cfg = load_config(model_dir)
@@ -87,7 +88,7 @@ class Whisper:
             raise ValueError(f"backend must be 'tensorrt' or 'torch', got {backend!r}")
         from .build import BuildOptions, ensure_engines
 
-        opts = BuildOptions(dtype=dtype, max_batch=max_batch, max_rows=max_rows)
+        opts = BuildOptions(dtype=dtype, max_batch=max_batch, max_rows=max_rows, **build_options)
         engine_dir = ensure_engines(model_dir, cfg, opts, cache_dir)
         return cls(cfg, tokenizer, TRTBackend(cfg, engine_dir), None, max_batch)
 
@@ -118,7 +119,8 @@ class Whisper:
         if key not in self._searches:
             step = partial(self.backend.step_fn, cross=self.cross(windows))
             self._searches[key] = Search(self.cfg, step, windows, rows, prompt_length, mode,
-                                         dtype=self.backend.dtype, device=self.device)
+                                         dtype=self.backend.dtype, device=self.device,
+                                         buckets=self.backend.buckets)
         return self._searches[key]
 
     def _prefill(self, windows: int, rows: torch.Tensor, cache: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
@@ -166,10 +168,12 @@ class Whisper:
         best_of: int = 5,
         suppress_tokens: tuple[int, ...] | None = (-1,),
         suppress_blank: bool = True,
+        seed: int = 0,
     ) -> list[WindowResult]:
         """CTranslate2's ``Whisper.generate`` on encoded windows (``cross`` from :meth:`encode`), as
         faster-whisper calls it: beam search at temperature 0 (greedy for ``beam_size=1``), else ``best_of``
-        samples. ``prompt``: one for all windows or one per window (all of the same length)."""
+        samples (``seed``: their random numbers; the same seed, the same samples). ``prompt``: one for all
+        windows or one per window (all of the same length)."""
         windows = cross.shape[2]
         prompts = [prompt] * windows if not prompt or isinstance(prompt[0], int) else prompt
         if len({len(p) for p in prompts}) != 1:
@@ -185,7 +189,7 @@ class Whisper:
         begin = self.cfg.begin_suppress_tokens if suppress_blank else ()
         rows_t = torch.tensor(prompts, dtype=torch.long)
         return search.run(rows_t, partial(self._prefill, windows), list(suppress), list(begin),
-                          temperature=temperature if temperature > 0 else 1.0)
+                          temperature=temperature if temperature > 0 else 1.0, seed=seed)
 
     @_on_stream
     def detect_language(self, cross: torch.Tensor) -> list[list[tuple[str, float]]]:
@@ -222,6 +226,7 @@ class Whisper:
         suppress_tokens: tuple[int, ...] | None = (-1,),
         suppress_blank: bool = True,
         batch_size: int = 8,
+        seed: int = 0,
     ) -> list[Decoded]:
         """Up-to-30 s windows decoded on their own (no timestamps, no previous text), each as faster-whisper's
         ``generate_with_fallback`` decodes a window, batched: every temperature decodes the windows still
@@ -240,7 +245,7 @@ class Whisper:
                 idx = pending[start : start + batch_size]
                 cross = self.encode(feats[idx])
                 results = self.generate(cross, prompt, beam_size, temperature, best_of, suppress_tokens,
-                                        suppress_blank)
+                                        suppress_blank, seed=seed + start)
                 for i, r in zip(idx, results):
                     text = self.tokenizer.decode(r.tokens).strip()
                     d = {"text": text, "tokens": r.tokens, "avg_logprob": r.hypothesis.avg_logprob,

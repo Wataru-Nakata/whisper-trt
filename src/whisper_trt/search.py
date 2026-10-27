@@ -100,6 +100,7 @@ class Search:
         device: str | torch.device = "cuda",
         max_length: int = 448,
         graphs: bool | None = None,
+        buckets: bool = True,
     ):
         if mode not in ("beam", "greedy", "sample"):
             raise ValueError(f"unknown search mode {mode!r}")
@@ -110,7 +111,10 @@ class Search:
         self.P = prompt_length
         self.max_new = max_new_tokens(prompt_length, max_length)
         self.capacity = prompt_length + self.max_new
-        self.buckets = [c for c in cache_buckets(self.capacity) if c >= prompt_length + 1] or [self.capacity]
+        # Cache length buckets, so that a step reads only as much cache as it needs; without them (buckets=False:
+        # attention kernels that read only the slots below the offset anyway) one length for the whole decode.
+        self.buckets = [c for c in cache_buckets(self.capacity) if c >= prompt_length + 1] if buckets else []
+        self.buckets = self.buckets or [self.capacity]
         L, H, dk, V = cfg.dec_layers, cfg.dec_heads, cfg.head_dim, cfg.vocab_size
         N, B, K, T = self.N, self.B, self.K, self.max_new
         dev = self.device
@@ -135,6 +139,9 @@ class Search:
         self.row_done = torch.zeros(N, dtype=torch.bool, device=dev)  # greedy/sampling rows
         self.length = torch.zeros(N, dtype=torch.long, device=dev)  # greedy/sampling: tokens without EOS
         self.temperature = torch.ones(1, dtype=torch.float32, device=dev)
+        self.seed = torch.zeros(1, dtype=torch.int64, device=dev)
+        if mode == "sample":  # (row, token) counters of the random numbers, see _uniform
+            self.counter = (torch.arange(N, device=dev)[:, None] * V + torch.arange(V, device=dev)).view(N, V)
         if mode == "beam":
             S = 2 * K + 1  # finished hypotheses: at most K - 1 + K, and a slot for the ones not registered
             self.h_count = torch.zeros(B, dtype=torch.long, device=dev)
@@ -212,10 +219,23 @@ class Search:
         else:
             self._greedy(logp)
 
+    def _uniform(self) -> torch.Tensor:
+        """Uniform random numbers [N, V] in (0, 1) from a counter-based hash (PCG's output function, on 32-bit
+        words in int64 arithmetic) of the seed, the step and each (row, token): no generator state, so it runs
+        inside a captured CUDA graph (torch's generator does not, on the model's stream), and a seed gives
+        the same samples."""
+        mask = 0xFFFFFFFF
+        x = (self.counter + (self.seed * 0x6C8E9CF5 + self.t * 0x85EBCA77)) & mask  # (products < 2**63)
+        for _ in range(2):
+            x = (x * 747796405 + 2891336453) & mask
+            x = (((x >> ((x >> 28) + 4)) ^ x) * 277803737) & mask
+            x = ((x >> 22) ^ x) & mask
+        return (x.float() + 0.5) / 4294967296.0
+
     def _greedy(self, logp: torch.Tensor) -> None:
         if self.mode == "sample":
             scaled = (logp / self.temperature).log_softmax(-1)
-            u = torch.rand_like(scaled).clamp_(min=1e-20)
+            u = self._uniform().clamp_(min=1e-20)
             token = (scaled - (-u.log()).log()).argmax(-1)  # Gumbel-max: a sample of softmax(logp / T)
         else:
             token = logp.argmax(-1)
@@ -284,6 +304,7 @@ class Search:
         suppress: list[int],
         begin_suppress: list[int],
         temperature: float = 1.0,
+        seed: int = 0,
         check_every: int = 4,
     ) -> list[WindowResult]:
         """Decode. ``prompt`` [B, P] token ids (every window's rows get its prompt). ``prefill(tokens, cache,
@@ -299,6 +320,7 @@ class Search:
         if begin_suppress:
             self.begin[torch.tensor(list(begin_suppress), device=self.device)] = True
         self.temperature.fill_(temperature)
+        self.seed.fill_(seed & 0x7FFFFFFF)
         self.cum.zero_()
         if self.mode == "beam":  # only the first beam takes part in the first step
             self.cum.view(B, K)[:, 1:] = float("-inf")

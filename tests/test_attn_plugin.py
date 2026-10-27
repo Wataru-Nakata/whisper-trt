@@ -58,3 +58,27 @@ def test_cross_attn_triton(s):
     for config in attn_plugin.TACTICS["cross_attn"]:
         out = attn_plugin.cross_attn_triton(q, k, v, config).float()
         assert (out - ref).abs().max() < 2e-2, config
+
+
+def test_cross_split_reference_equals_attention():
+    g = torch.Generator().manual_seed(2)
+    q = torch.randn(2, 5, 4 * 64, generator=g)
+    k = torch.randn(2, 4, 1500, 64, generator=g)
+    v = torch.randn(2, 4, 1500, 64, generator=g)
+    out = attn_plugin.cross_attn_combine(attn_plugin.cross_attn_split(q, k, v), q)
+    assert torch.allclose(out, attn_plugin.cross_attn(q, k, v), atol=1e-5)
+
+
+@cuda
+@pytest.mark.parametrize("s", [1, 5, 20])
+def test_cross_split_triton(s):
+    g = torch.Generator().manual_seed(3)
+    q = torch.randn(3, s, 20 * 64, generator=g).cuda().half()
+    k = torch.randn(3, 20, 1500, 64, generator=g).cuda().half()
+    v = torch.randn(3, 20, 1500, 64, generator=g).cuda().half()
+    ref = attn_plugin.cross_attn(q, k, v).float()
+    for config in attn_plugin.TACTICS["cross_split"]:
+        part = attn_plugin.cross_attn_split_triton(q, k, v, config)
+        for combine in attn_plugin.TACTICS["cross_combine"]:
+            out = attn_plugin.cross_attn_combine_triton(part, q, combine).float()
+            assert (out - ref).abs().max() < 2e-2, (config, combine)

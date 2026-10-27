@@ -27,6 +27,10 @@ whisper-trt = "whisper_trt.cli:main"
 [dependency-groups]
 dev = ["pytest", "ruff"]
 
+[tool.uv]
+# The tested combination (and owsm-trt's): the job environment is built from this lock (scripts/build_env_tar.sh)
+constraint-dependencies = ["torch==2.14.1", "tensorrt==11.4.0.106"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/whisper_trt"]
 

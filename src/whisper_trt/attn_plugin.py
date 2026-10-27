@@ -10,6 +10,10 @@ attention kernel. These kernels read everything where it is instead:
   takes its parent's ``src`` row; the token it is fed next is written to its own row (see search.py).
 * :func:`cross_attn`: queries [W, S, H·D] and the cross-attention keys/values [W, H, T, D] -> [W, S, H·D]
   (a window's beams are its K * S queries).
+* :func:`cross_attn_split` + :func:`cross_attn_combine`: the same attention split over the T keys
+  ("flash-decoding"): one program per (window, head) walks 1500 keys one block after another, which leaves
+  most of the GPU idle with few windows (20 programs for one window); SPLITS programs per (window, head)
+  each take a slice of the keys and write their partial softmax state, which a second kernel combines.
 
 Both are torch custom ops (with a PyTorch reference implementation) that export to ONNX nodes of domain
 ``whisper_trt``; the TensorRT ONNX parser maps those to the plugins :func:`register_plugins` defines. The
@@ -36,6 +40,9 @@ TACTICS = {
     "self_attn": [(16, 64, 4, 2), (16, 32, 4, 2), (16, 128, 4, 2), (16, 64, 4, 3), (32, 64, 4, 2), (16, 64, 8, 2)],
     "cross_attn": [(16, 64, 4, 2), (16, 128, 4, 2), (16, 64, 4, 3), (16, 128, 8, 2), (32, 64, 4, 2), (16, 32, 4, 3)],
 }  # fmt: skip
+TACTICS["cross_split"] = [(16, 64, 4, 2), (16, 32, 4, 2), (16, 64, 4, 3), (16, 128, 4, 2), (32, 64, 4, 2)]
+TACTICS["cross_combine"] = [(16, 0, 4, 1), (16, 0, 2, 1)]
+SPLITS = 8  # key slices of the split cross-attention (1500 / 8 = 188 keys each)
 TUNE = True  # False: only the first configuration (no tactic timing)
 _SHAPE = {"heads": 0, "head_dim": 0}  # of the model being built (set by register_plugins)
 _REGISTERED = False
@@ -123,18 +130,76 @@ def _(q, k, v):
     return torch.empty_like(q)
 
 
-def _onnx_op(name: str, n_in: int):
+def _log2_scores(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+    b, s, _ = q.shape
+    h, d = k.shape[1], k.shape[3]
+    qh = q.view(b, s, h, d).transpose(1, 2).float()  # [B, H, S, D]
+    return (qh @ k.float().transpose(-1, -2)) * _qk_scale(d)  # [B, H, S, T], log2 units
+
+
+@torch.library.custom_op("whisper_trt::cross_attn_split", mutates_args=())
+def cross_attn_split(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """Partial attention of q [B, S, H·D] over SPLITS slices of the keys k/v [B, H, T, D]: per slice the
+    unnormalized output, the running maximum (log2 units) and the sum of exponentials ->
+    [B, H, SPLITS, S, D + 2] (fp32)."""
+    b, s, _ = q.shape
+    h, t, d = k.shape[1:]
+    scores = _log2_scores(q, k)
+    chunk = -(-t // SPLITS)
+    out = q.new_zeros(b, h, SPLITS, s, d + 2, dtype=torch.float32)
+    for i in range(SPLITS):
+        lo, hi = i * chunk, min((i + 1) * chunk, t)
+        if lo >= hi:
+            out[:, :, i, :, d] = float("-inf")
+            continue
+        sc = scores[..., lo:hi]
+        m = sc.amax(-1, keepdim=True)
+        p = torch.exp2(sc - m)
+        out[:, :, i, :, :d] = p @ v[:, :, lo:hi].float()
+        out[:, :, i, :, d] = m[..., 0]
+        out[:, :, i, :, d + 1] = p.sum(-1)
+    return out
+
+
+@cross_attn_split.register_fake
+def _(q, k, v):
+    return q.new_empty(q.shape[0], k.shape[1], SPLITS, q.shape[1], k.shape[3] + 2, dtype=torch.float32)
+
+
+@torch.library.custom_op("whisper_trt::cross_attn_combine", mutates_args=())
+def cross_attn_combine(part: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
+    """The slices of :func:`cross_attn_split` combined -> [B, S, H·D] in ``q``'s type (``q`` only gives the
+    type and shape)."""
+    d = part.shape[-1] - 2
+    m = part[..., d]  # [B, H, N, S]
+    top = m.amax(2, keepdim=True)
+    w = torch.exp2(m - top)  # slices without keys: weight 0
+    num = (w[..., None] * part[..., :d]).sum(2)  # [B, H, S, D]
+    den = (w * part[..., d + 1]).sum(2)
+    return _merge((num / den[..., None]).to(q.dtype))
+
+
+@cross_attn_combine.register_fake
+def _(part, q):
+    return torch.empty_like(q)
+
+
+def _onnx_op(name: str, n_in: int, out: int = 0):
+    """The ONNX node of a plugin with ``n_in`` inputs; its output has the type of input ``out``, or its own
+    type for ``out=-1``."""
     import onnxscript
     from onnx.defs import OpSchema
 
     types = [f"tensor({t})" for t in ("float16", "bfloat16", "float", "int64", "int32")]
+    out_type = "TO" if out < 0 else f"T{out}"
+    constraints = [(f"T{i}", types, "") for i in range(n_in)] + ([("TO", types, "")] if out < 0 else [])
     schema = OpSchema(
         name,
         NAMESPACE,
         1,
         inputs=[OpSchema.FormalParameter(f"input{i}", f"T{i}") for i in range(n_in)],
-        outputs=[OpSchema.FormalParameter("output", "T0")],
-        type_constraints=[(f"T{i}", types, "") for i in range(n_in)],
+        outputs=[OpSchema.FormalParameter("output", out_type)],
+        type_constraints=constraints,
         attributes=[
             OpSchema.Attribute("plugin_namespace", OpSchema.AttrType.STRING, "TensorRT plugin namespace"),
             OpSchema.Attribute("plugin_version", OpSchema.AttrType.STRING, "TensorRT plugin version"),
@@ -154,6 +219,8 @@ def onnx_translations() -> dict:
     return {
         ops.self_attn.default: _onnx_op("self_attn", 5),
         ops.cross_attn.default: _onnx_op("cross_attn", 3),
+        ops.cross_attn_split.default: _onnx_op("cross_attn_split", 3, out=-1),
+        ops.cross_attn_combine.default: _onnx_op("cross_attn_combine", 2, out=1),
     }
 
 
@@ -236,6 +303,65 @@ if triton is not None:
             )
         tl.store(y + rows, (acc / l_i[:, None]).to(y.dtype.element_ty), mask=sm)
 
+    @triton.jit
+    def _cross_split_kernel(q_in, kx, vx, S, T, part,
+                            H: tl.constexpr, D: tl.constexpr, BS: tl.constexpr, BN: tl.constexpr,
+                            NS: tl.constexpr, QK_SCALE: tl.constexpr):  # fmt: skip
+        bh = tl.program_id(0)
+        sb = tl.program_id(1)
+        sp = tl.program_id(2)  # key slice
+        b = bh // H
+        h = bh % H
+        HD: tl.constexpr = H * D
+        s = sb * BS + tl.arange(0, BS)
+        sm = (s < S)[:, None]
+        d = tl.arange(0, D)[None, :]
+        q = tl.load(q_in + (b * S + s).to(tl.int64)[:, None] * HD + h * D + d, mask=sm, other=0.0)
+        m_i = tl.full([BS], float("-inf"), tl.float32)
+        l_i = tl.zeros([BS], tl.float32)
+        acc = tl.zeros([BS, D], tl.float32)
+        chunk = tl.cdiv(T, NS)
+        lo = sp * chunk
+        hi = tl.minimum(lo + chunk, T)
+        base = (b * H + h).to(tl.int64) * T * D
+        for j0 in range(lo, hi, BN):
+            j = j0 + tl.arange(0, BN)
+            ptr = base + j[:, None] * D + d
+            m_i, l_i, acc = _attend(
+                q, kx + ptr, vx + ptr, (j < hi)[:, None], (j < hi)[None, :], m_i, l_i, acc, QK_SCALE
+            )
+        # part [B, H, NS, S, D + 2]: acc, then the maximum and the sum
+        row = (((b * H + h) * NS + sp) * S + s).to(tl.int64) * (D + 2)
+        tl.store(part + row[:, None] + d, acc, mask=sm)
+        tl.store(part + row + D, m_i, mask=s < S)
+        tl.store(part + row + D + 1, l_i, mask=s < S)
+
+    @triton.jit
+    def _cross_combine_kernel(part, q_in, S, y,
+                              H: tl.constexpr, D: tl.constexpr, BS: tl.constexpr, NS: tl.constexpr):  # fmt: skip
+        bh = tl.program_id(0)
+        sb = tl.program_id(1)
+        b = bh // H
+        h = bh % H
+        HD: tl.constexpr = H * D
+        s = sb * BS + tl.arange(0, BS)
+        smask = s < S
+        d = tl.arange(0, D)[None, :]
+        top = tl.full([BS], float("-inf"), tl.float32)
+        for sp in tl.static_range(NS):
+            row = (((b * H + h) * NS + sp) * S + s).to(tl.int64) * (D + 2)
+            top = tl.maximum(top, tl.load(part + row + D, mask=smask, other=float("-inf")))
+        num = tl.zeros([BS, D], tl.float32)
+        den = tl.zeros([BS], tl.float32)
+        for sp in tl.static_range(NS):
+            row = (((b * H + h) * NS + sp) * S + s).to(tl.int64) * (D + 2)
+            m = tl.load(part + row + D, mask=smask, other=float("-inf"))
+            w = tl.where(m == float("-inf"), 0.0, tl.exp2(m - top))
+            num += w[:, None] * tl.load(part + row[:, None] + d, mask=smask[:, None], other=0.0)
+            den += w * tl.load(part + row + D + 1, mask=smask, other=0.0)
+        out = y + (b * S + s).to(tl.int64)[:, None] * HD + h * D + d
+        tl.store(out, (num / den[:, None]).to(y.dtype.element_ty), mask=smask[:, None])
+
 
 def _qk_scale(d: int) -> float:
     return d**-0.5 * math.log2(math.e)
@@ -278,12 +404,42 @@ def cross_attn_triton(
     return y
 
 
+def cross_attn_split_triton(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+    config: tuple[int, int, int, int] = TACTICS["cross_split"][0],
+) -> torch.Tensor:
+    """The :func:`cross_attn_split` kernel launched directly, for tests and timing."""
+    b, s, _ = q.shape
+    h, t, d = k.shape[1:]
+    bs, bn, warps, stages = config
+    part = q.new_empty(b, h, SPLITS, s, d + 2, dtype=torch.float32)
+    _cross_split_kernel[(b * h, triton.cdiv(s, bs), SPLITS)](
+        q, k, v, s, t, part, H=h, D=d, BS=bs, BN=bn, NS=SPLITS, QK_SCALE=_qk_scale(d), num_warps=warps,
+        num_stages=stages,
+    )  # fmt: skip
+    return part
+
+
+def cross_attn_combine_triton(
+    part: torch.Tensor, q: torch.Tensor, config: tuple[int, int, int, int] = TACTICS["cross_combine"][0]
+) -> torch.Tensor:
+    b, h, _, s, d2 = part.shape
+    bs, _, warps, stages = config
+    y = torch.empty_like(q)
+    _cross_combine_kernel[(b * h, triton.cdiv(s, bs))](
+        part, q, s, y, H=h, D=d2 - 2, BS=bs, NS=SPLITS, num_warps=warps, num_stages=stages
+    )
+    return y
+
+
 # --- TensorRT plugins ---
 
 _COMPILED: dict = {}
 _KERNELS = {  # plugin -> kernel, its arguments (inputs, scalars, outputs)
     "self_attn": ("_self_attn_kernel", ["qkv", "kc", "vc", "offs", "src", "S", "C", "y"]),
     "cross_attn": ("_cross_attn_kernel", ["q_in", "kx", "vx", "S", "T", "y"]),
+    "cross_split": ("_cross_split_kernel", ["q_in", "kx", "vx", "S", "T", "part"]),
+    "cross_combine": ("_cross_combine_kernel", ["part", "q_in", "S", "y"]),
 }
 
 
@@ -299,8 +455,12 @@ def _compile(kind: str, tactic: int, dtype: str):
     key = (kind, h, d, dtype, bs, bn, warps, stages)
     if key not in _COMPILED:
         name, args = _KERNELS[kind]
-        types = {"offs": "*i64", "src": "*i32", "S": "i32", "C": "i32", "T": "i32"}
+        types = {"offs": "*i64", "src": "*i32", "part": "*fp32", "S": "i32", "C": "i32", "T": "i32"}
         consts = {"H": h, "D": d, "BS": bs, "BN": bn, "QK_SCALE": _qk_scale(d)}
+        if kind == "cross_split":
+            consts["NS"] = SPLITS
+        elif kind == "cross_combine":
+            consts = {"H": h, "D": d, "BS": bs, "NS": SPLITS}
         signature = {a: types.get(a, f"*{dtype}") for a in args} | dict.fromkeys(consts, "constexpr")
         # TensorRT and torch buffers are 16-byte aligned: lets loads/stores be vectorized
         aligned = {(i,): [["tt.divisibility", 16]] for i, a in enumerate(args) if signature[a][0] == "*"}
@@ -329,12 +489,15 @@ def register_plugins(heads: int, head_dim: int) -> None:
     Tune = List[trtp.AutoTuneCombination]
     names = {trt.float16: ("FP16", "fp16"), trt.bfloat16: ("BF16", "bf16")}
 
-    def launch(kind: str, x: Desc, tactic: int, extras: list):
+    def launch(kind: str, x: Desc, tactic: int, extras: list, grid_z: int = 1):
+        """Grid (rows of ``x`` x heads, blocks of its tokens, ``grid_z``)."""
         rows, tokens = x.shape_expr[0], x.shape_expr[1]
         name, ptx, warps, shared, bs = _compile(kind, tactic, names[x.dtype][1])
         params = trtp.KernelLaunchParams()
         params.grid_x = rows * _SHAPE["heads"]
         params.grid_y = trtp.cdiv(tokens, bs)
+        if grid_z > 1:
+            params.grid_z = grid_z
         params.block_x = warps * 32
         params.shared_mem = shared
         args = trtp.SymIntExprs(len(extras))
@@ -342,9 +505,10 @@ def register_plugins(heads: int, head_dim: int) -> None:
             args[i] = trtp.SymInt32(e)
         return name, ptx, params, args
 
-    def tune(kind: str, x: Desc, int_inputs: dict | None = None) -> Tune:
+    def tune(kind: str, x: Desc, other_types: dict | None = None) -> Tune:
+        """Every input/output in ``x``'s type, except those given by index in ``other_types``."""
         args = [a for a in _KERNELS[kind][1] if a not in ("S", "C", "T")]  # inputs + outputs
-        types = ", ".join((int_inputs or {}).get(i, names[x.dtype][0]) for i in range(len(args)))
+        types = ", ".join((other_types or {}).get(i, names[x.dtype][0]) for i in range(len(args)))
         tactics = range(1, len(TACTICS[kind]) + 1) if TUNE else [1]
         return [trtp.AutoTuneCombination(types, "LINEAR", list(tactics))]
 
@@ -376,5 +540,30 @@ def register_plugins(heads: int, head_dim: int) -> None:
     @trtp.aot_impl(f"{NAMESPACE}::cross_attn")
     def _cross_aot(q: Desc, k: Desc, v: Desc, outputs: Tuple[Desc], tactic: int) -> AOT:
         return launch("cross_attn", q, tactic, [q.shape_expr[1], k.shape_expr[2]])
+
+    @trtp.register(f"{NAMESPACE}::cross_attn_split")
+    def _split_desc(q: Desc, k: Desc, v: Desc) -> Tuple[Desc]:
+        h, d = _SHAPE["heads"], _SHAPE["head_dim"]
+        return (trtp.from_shape_expr((q.shape_expr[0], h, SPLITS, q.shape_expr[1], d + 2), trt.float32),)
+
+    @trtp.autotune(f"{NAMESPACE}::cross_attn_split")
+    def _split_tune(q: Desc, k: Desc, v: Desc, outputs: Tuple[Desc]) -> Tune:
+        return tune("cross_split", q, {3: "FP32"})
+
+    @trtp.aot_impl(f"{NAMESPACE}::cross_attn_split")
+    def _split_aot(q: Desc, k: Desc, v: Desc, outputs: Tuple[Desc], tactic: int) -> AOT:
+        return launch("cross_split", q, tactic, [q.shape_expr[1], k.shape_expr[2]], grid_z=SPLITS)
+
+    @trtp.register(f"{NAMESPACE}::cross_attn_combine")
+    def _combine_desc(part: Desc, q: Desc) -> Tuple[Desc]:
+        return (q.like(),)
+
+    @trtp.autotune(f"{NAMESPACE}::cross_attn_combine")
+    def _combine_tune(part: Desc, q: Desc, outputs: Tuple[Desc]) -> Tune:
+        return tune("cross_combine", q, {0: "FP32"})
+
+    @trtp.aot_impl(f"{NAMESPACE}::cross_attn_combine")
+    def _combine_aot(part: Desc, q: Desc, outputs: Tuple[Desc], tactic: int) -> AOT:
+        return launch("cross_combine", q, tactic, [q.shape_expr[1]])
 
     _REGISTERED = True

@@ -21,6 +21,8 @@ class LayerNorm(nn.LayerNorm):
     such, TensorRT would otherwise sum the squares of fp16 activations in fp16."""
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not Precision.ln32:
+            return super().forward(x)
         w, b = self.weight.float(), self.bias.float()
         return F.layer_norm(x.float(), self.normalized_shape, w, b, self.eps).to(x.dtype)
 
@@ -82,6 +84,7 @@ class Precision:
     """Export options: parts of the fp16 graph computed in fp32 (TensorRT keeps the types it is given)."""
 
     softmax32 = False  # attention probabilities
+    ln32 = True  # LayerNorm (see LayerNorm)
     # The MLPs' GELU: TensorRT's fp16 erf multiplied the encoder's error by 5 (scripts/encoder_variants.py)
     gelu32 = True
     residual32 = False  # the encoder's residual stream
@@ -231,7 +234,10 @@ class Decoder(nn.Module):
             xa = layer.encoder_attn
             h = xa.q_proj(layer.encoder_attn_layer_norm(x))  # [B, S, d]
             h = h.reshape(cross_k[i].shape[0], -1, h.shape[-1])  # [W, K*S, d]
-            if plugin_cross:
+            if "cross_split" in self.plugins:
+                part = attn_plugin.cross_attn_split(h, cross_k[i], cross_v[i])
+                y = xa.out_proj(attn_plugin.cross_attn_combine(part, h))
+            elif plugin_cross:
                 y = xa.out_proj(attn_plugin.cross_attn(h, cross_k[i], cross_v[i]))
             else:
                 y = xa.merge(attend(xa.heads(h), cross_k[i], cross_v[i], explicit=explicit))  # [W, K*S, d]

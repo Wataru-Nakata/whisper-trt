@@ -12,3 +12,8 @@ for spec in ${LANGS:-ja:multilingual/jvs_test.json en:testdata/librispeech_test_
       --configs ${CONFIGS:-5x8} --out $OUT/ours-$lang-${b//\//-}.json
   done
 done
+for lang in ${PROFILE_LANGS:-en ja}; do
+  echo "=== profile $lang"
+  $PY scripts/profile_decode.py $OUT/clips-$lang.npz --lang $lang --beam 5 --batch 8
+  $PY scripts/profile_decode.py $OUT/clips-$lang.npz --lang $lang --beam 1 --batch 1
+done

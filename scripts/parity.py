@@ -1,0 +1,131 @@
+"""Compare our decodes with faster-whisper's (scripts/ref_ct2.py) on the same waveforms.
+
+    python scripts/parity.py WAVES.npz REF.json --backend torch --dtype float32 --out OURS.json
+
+Prints feature/encoder differences (if REF's features file exists), and per configuration: RTFx (encoder +
+decoding of all windows, features included), identical transcripts and token sequences against each
+reference run of the same search, the largest score / no-speech differences, and WER against the manifest.
+"""
+
+import argparse
+import json
+import re
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+
+from whisper_trt import Whisper
+
+
+def words(text: str) -> list[str]:
+    return re.sub(r"[^\w\s']", " ", text.lower()).split()
+
+
+def edit_distance(a: list, b: list) -> int:
+    prev = list(range(len(b) + 1))
+    for i, x in enumerate(a, 1):
+        cur = [i] + [0] * len(b)
+        for j, y in enumerate(b, 1):
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (x != y))
+        prev = cur
+    return prev[-1]
+
+
+def chars(text: str) -> list[str]:
+    return list(re.sub(r"[\W_]+", "", text.lower()))
+
+
+CER_LANGS = {"ja", "zh", "yue", "th"}  # written without spaces: character error rate
+UNITS = words
+
+
+def wer(hyps: list[str], refs: list[str]) -> float:
+    errors = sum(edit_distance(UNITS(h), UNITS(r)) for h, r in zip(hyps, refs))
+    return errors / max(1, sum(len(UNITS(r)) for r in refs))
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("waves")
+    ap.add_argument("ref")
+    ap.add_argument("--model", default="openai/whisper-large-v3")
+    ap.add_argument("--backend", default="tensorrt")
+    ap.add_argument("--dtype", default="float16")
+    ap.add_argument("--lang", default="en")
+    ap.add_argument("--configs", nargs="+", default=["1x1", "5x1", "5x8"], help="BEAMxBATCH")
+    ap.add_argument("--repeat", type=int, default=2)
+    ap.add_argument("--out")
+    args = ap.parse_args()
+    global UNITS
+    UNITS = chars if args.lang in CER_LANGS else words
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+
+    data = np.load(args.waves)
+    meta = json.loads(str(data["meta"]))
+    waves = [torch.from_numpy(data[f"w{i}"]) for i in range(len(meta))]
+    audio_s = sum(len(w) for w in waves) / 16000
+    ref = json.load(open(args.ref))
+    t0 = time.perf_counter()
+    model = Whisper.from_pretrained(args.model, backend=args.backend, dtype=args.dtype)
+    print(f"loaded {args.backend}/{args.dtype} in {time.perf_counter() - t0:.1f}s", flush=True)
+
+    feats_path = Path(args.ref.replace(".json", "-features.npz"))
+    if feats_path.exists():
+        f = np.load(feats_path)
+        k = f["feats"].shape[0]
+        ours = model.features(waves[:k])
+        d = (ours.cpu() - torch.from_numpy(f["feats"])).abs()
+        print(f"features: max |diff| {d.max():.3g} mean {d.mean():.3g}")
+        if model.model is not None:
+            with torch.inference_mode():
+                enc = model.model.encoder(ours.to(model.model.encoder.conv1.weight.dtype)).float().cpu()
+            e = torch.from_numpy(f["enc"])
+            d = (enc - e).abs()
+            print(f"encoder: max |diff| {d.max():.3g} mean {d.mean():.3g} (ref max |x| {e.abs().max():.3g})")
+
+    prompt = model.prompt(args.lang, without_timestamps=True)
+    out = {}
+    for cfg in args.configs:
+        beam, batch = map(int, cfg.split("x"))
+        times = []
+        for rep in range(args.repeat + 1):
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            rows = []
+            for i in range(0, len(waves), batch):
+                feats = model.features(waves[i : i + batch])
+                cross = model.encode(feats)
+                res = model.generate(cross, prompt, beam_size=beam)
+                rows += [{"tokens": r.tokens, "score": r.hypothesis.normalized, "no_speech_prob": r.no_speech_prob,
+                          "text": model.tokenizer.decode(r.tokens).strip()} for r in res]
+            torch.cuda.synchronize()
+            times.append(time.perf_counter() - t0)
+        best = min(times[1:]) if len(times) > 1 else times[0]
+        key = f"beam{beam}/b{batch}"
+        out[key] = {"rows": rows, "seconds": times, "rtfx": audio_s / best}
+        line = f"{key}: RTFx {audio_s / best:.1f}, {'CER' if UNITS is chars else 'WER'} {wer([r['text'] for r in rows], [m['text'] for m in meta]):.2%}"
+        for rkey, run in ref["runs"].items():
+            if not rkey.endswith(f"beam{beam}/b{batch}") and f"/beam{beam}/" not in rkey:
+                continue
+            rr = run["rows"]
+            same_text = sum(a["text"] == b["text"] for a, b in zip(rows, rr))
+            same_tok = sum(a["tokens"] == b["tokens"] for a, b in zip(rows, rr))
+            both = [(a, b) for a, b in zip(rows, rr) if a["tokens"] == b["tokens"]]
+            ds = max((abs(a["score"] - b["score"]) for a, b in both), default=0.0)
+            dn = max(abs(a["no_speech_prob"] - b["no_speech_prob"]) for a, b in zip(rows, rr))
+            rw = wer([r["text"] for r in rr], [m["text"] for m in meta])
+            line += (f"\n    vs {rkey} (RTFx {run['rtfx']:.1f}, WER {rw:.2%}): text {same_text}/{len(rr)}, "
+                     f"tokens {same_tok}/{len(rr)}, max |score diff| {ds:.2g}, max |no_speech diff| {dn:.2g}")
+            for i, (a, b) in enumerate(zip(rows, rr)):
+                if a["text"] != b["text"] and same_text >= len(rr) - 5:
+                    line += f"\n      [{i}] ours: {a['text']}\n      [{i}] ref:  {b['text']}"
+        print(line, flush=True)
+    if args.out:
+        json.dump(out, open(args.out, "w"), ensure_ascii=False, indent=1)
+
+
+if __name__ == "__main__":
+    main()

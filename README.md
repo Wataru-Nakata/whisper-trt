@@ -32,7 +32,7 @@ whisper-trt detect-language a.wav
 One H200, `openai/whisper-large-v3`, fp16, the language forced, no timestamps, beam 5 (the first pass of
 a clip-transcription workload). RTFx: seconds of audio per second of features + encoder + decoding, best of two
 passes; faster-whisper 1.2.1 (CTranslate2 4.8.2, fp16) decodes batches of 8 windows as its batched pipeline does
-(encoder + generate, its features computed apart).
+(encoder + generate in one pass; its features computed apart).
 
 | set | faster-whisper, batch 8 | **whisper-trt, 8 slots** | **16 slots** | **32 slots** |
 |---|---:|---:|---:|---:|
@@ -60,7 +60,8 @@ without VAD.
 
 * **Exactness.** In fp32 (`backend="torch", dtype="float32"`), whisper-trt gives faster-whisper fp32's tokens on
   every window: 300/300 for YODAS Japanese, English, German, Hindi, Tamil and Greek each (1800 windows; scores
-  within 1.4e-5; Hindi and Tamil have about 110 windows each at the token limit and 60-170 needing the fallback),
+  within 1.4e-5; Hindi and Tamil have about 110 windows each at the token limit and 60-170 needing the fallback;
+  Japanese and Tamil re-measured on the current code, the others before prompts became in-graph steps),
   and 73/73 on LibriSpeech dev-clean for greedy and beam 5. The search, the refills and the decisions are
   faster-whisper's.
 * **fp16** (the TensorRT engines; 8 and 32 slots give the same agreement within 0.7 points):

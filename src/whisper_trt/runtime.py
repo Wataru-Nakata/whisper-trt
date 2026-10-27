@@ -23,12 +23,23 @@ log = logging.getLogger(__name__)
 
 class TorchBackend:
     name = "torch"
-    buckets = True  # cache length buckets help (attention reads the whole cache)
 
-    def __init__(self, model: WhisperModel):
+    def __init__(self, model: WhisperModel, kernels: bool = False):
+        """``kernels``: the decoder's attention through the Triton kernels of attn_plugin (fused Q/K/V, the slot
+        table read in place, split cross-attention) instead of the PyTorch reference, for speed."""
         self.model = model
         self.cfg = model.cfg
         self.dtype = model.decoder.embed_tokens.weight.dtype
+        if kernels:
+            from . import attn_plugin
+
+            if attn_plugin.triton is None or not torch.cuda.is_available():
+                raise RuntimeError("the decoder kernels need CUDA and Triton")
+            for layer in model.decoder.layers:
+                layer.self_attn.fuse_qkv()
+            model.decoder.plugins = frozenset({"self", "cross", "cross_split", "logits"})
+            attn_plugin.RUNTIME_TRITON = True
+            self.name = "torch+kernels"
 
     def encode(self, feats: torch.Tensor, cross: torch.Tensor, lane: int = 0) -> None:
         with torch.inference_mode():
@@ -93,8 +104,6 @@ class TRTBackend:
         self.decoder = self._load(engine_dir / "decoder.engine")
         meta = json.loads((engine_dir / "build.json").read_text())
         self.profiles = meta["profiles"]
-        # the attention plugins read only the cache slots below the offset: no cache length buckets needed
-        self.buckets = not meta.get("attn_plugin", False)
         self._scratch: dict[int, torch.Tensor] = {}
         self._enc_ctxs: dict[int, object] = {}
 

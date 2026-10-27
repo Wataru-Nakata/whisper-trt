@@ -14,6 +14,8 @@ attention kernel. These kernels read everything where it is instead:
   ("flash-decoding"): one program per (window, head) walks 1500 keys one block after another, which leaves
   most of the GPU idle with few windows (20 programs for one window); SPLITS programs per (window, head)
   each take a slice of the keys and write their partial softmax state, which a second kernel combines.
+* :func:`logits32`: the vocabulary projection x [B, S, d] @ w [V, d]^T with fp32 accumulation, fp32 out:
+  TensorRT's fp16 GEMMs accumulate less precisely, and these are the scores beam search compares.
 
 Both are torch custom ops (with a PyTorch reference implementation) that export to ONNX nodes of domain
 ``whisper_trt``; the TensorRT ONNX parser maps those to the plugins :func:`register_plugins` defines. The
@@ -42,9 +44,16 @@ TACTICS = {
 }  # fmt: skip
 TACTICS["cross_split"] = [(16, 64, 4, 2), (16, 32, 4, 2), (16, 64, 4, 3), (16, 128, 4, 2), (32, 64, 4, 2)]
 TACTICS["cross_combine"] = [(16, 0, 4, 1), (16, 0, 2, 1)]
+# (rows, vocabulary entries, reduction block per program, warps, stages); at most 48 KB of shared memory
+# (stages x (rows + entries) x block x 2 bytes): TensorRT's ahead-of-time launch does not opt into more
+LINEAR_TACTICS = [(16, 128, 64, 4, 2), (32, 128, 64, 4, 2), (64, 64, 64, 4, 2), (16, 256, 32, 8, 2),
+                  (32, 64, 64, 4, 3), (16, 128, 32, 4, 3), (64, 128, 32, 4, 2), (128, 64, 32, 4, 2)]
 SPLITS = 8  # key slices of the split cross-attention (1500 / 8 = 188 keys each)
 TUNE = True  # False: only the first configuration (no tactic timing)
-_SHAPE = {"heads": 0, "head_dim": 0}  # of the model being built (set by register_plugins)
+# The custom ops below run their Triton kernels instead of the PyTorch reference on CUDA tensors (the PyTorch
+# decoder of runtime.TorchBackend with plugins); off while exporting and for the reference checks.
+RUNTIME_TRITON = False
+_SHAPE = {"heads": 0, "head_dim": 0, "d_model": 0, "vocab": 0}  # of the model being built (register_plugins)
 _REGISTERED = False
 
 
@@ -98,6 +107,8 @@ def self_attn(
 
     qkv [B, S, 3·H·D] (queries, keys, values; heads in order), k_cache/v_cache [B, H, C, D],
     offset [B] int64, src [B, C] int32 (the row holding each slot) -> [B, S, H·D]"""
+    if RUNTIME_TRITON and qkv.is_cuda:
+        return self_attn_triton(qkv, k_cache, v_cache, offset, src)
     b, s, _ = qkv.shape
     h, c, d = k_cache.shape[1:]
     k_cache, v_cache = gather_cache(k_cache, src), gather_cache(v_cache, src)
@@ -142,6 +153,8 @@ def cross_attn_split(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch
     """Partial attention of q [B, S, H·D] over SPLITS slices of the keys k/v [B, H, T, D]: per slice the
     unnormalized output, the running maximum (log2 units) and the sum of exponentials ->
     [B, H, SPLITS, S, D + 2] (fp32)."""
+    if RUNTIME_TRITON and q.is_cuda:
+        return cross_attn_split_triton(q, k, v)
     b, s, _ = q.shape
     h, t, d = k.shape[1:]
     scores = _log2_scores(q, k)
@@ -170,6 +183,8 @@ def _(q, k, v):
 def cross_attn_combine(part: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
     """The slices of :func:`cross_attn_split` combined -> [B, S, H·D] in ``q``'s type (``q`` only gives the
     type and shape)."""
+    if RUNTIME_TRITON and part.is_cuda:
+        return cross_attn_combine_triton(part, q)
     d = part.shape[-1] - 2
     m = part[..., d]  # [B, H, N, S]
     top = m.amax(2, keepdim=True)
@@ -182,6 +197,19 @@ def cross_attn_combine(part: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
 @cross_attn_combine.register_fake
 def _(part, q):
     return torch.empty_like(q)
+
+
+@torch.library.custom_op("whisper_trt::logits32", mutates_args=())
+def logits32(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """x [B, S, d] (fp16) @ w [V, d]^T, accumulated and returned in fp32 -> [B, S, V]."""
+    if RUNTIME_TRITON and x.is_cuda:
+        return logits32_triton(x, w)
+    return x.float() @ w.float().t()
+
+
+@logits32.register_fake
+def _(x, w):
+    return x.new_empty(x.shape[0], x.shape[1], w.shape[0], dtype=torch.float32)
 
 
 def _onnx_op(name: str, n_in: int, out: int = 0):
@@ -221,6 +249,7 @@ def onnx_translations() -> dict:
         ops.cross_attn.default: _onnx_op("cross_attn", 3),
         ops.cross_attn_split.default: _onnx_op("cross_attn_split", 3, out=-1),
         ops.cross_attn_combine.default: _onnx_op("cross_attn_combine", 2, out=1),
+        ops.logits32.default: _onnx_op("logits32", 2, out=-1),
     }
 
 
@@ -363,6 +392,26 @@ if triton is not None:
         tl.store(out, (num / den[:, None]).to(y.dtype.element_ty), mask=smask[:, None])
 
 
+    @triton.jit
+    def _linear32_kernel(x, w, M, y, N: tl.constexpr, K: tl.constexpr,
+                         BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):  # fmt: skip
+        pm = tl.program_id(0)
+        pn = tl.program_id(1)
+        rm = pm * BM + tl.arange(0, BM)
+        rn = pn * BN + tl.arange(0, BN)
+        rk = tl.arange(0, BK)
+        acc = tl.zeros([BM, BN], tl.float32)
+        for k0 in range(0, K, BK):
+            k = k0 + rk
+            a = tl.load(x + rm.to(tl.int64)[:, None] * K + k[None, :], mask=(rm[:, None] < M) & (k[None, :] < K),
+                        other=0.0)
+            b = tl.load(w + rn.to(tl.int64)[:, None] * K + k[None, :], mask=(rn[:, None] < N) & (k[None, :] < K),
+                        other=0.0)  # [BN, BK]: rows of w, contiguous along the reduction
+            acc += tl.dot(a, tl.trans(b))
+        out = y + rm.to(tl.int64)[:, None] * N + rn[None, :]
+        tl.store(out, acc, mask=(rm[:, None] < M) & (rn[None, :] < N))
+
+
 def _qk_scale(d: int) -> float:
     return d**-0.5 * math.log2(math.e)
 
@@ -432,6 +481,19 @@ def cross_attn_combine_triton(
     return y
 
 
+def logits32_triton(x: torch.Tensor, w: torch.Tensor, config: tuple = LINEAR_TACTICS[0]) -> torch.Tensor:
+    """The :func:`logits32` kernel launched directly."""
+    b, s, k = x.shape
+    n = w.shape[0]
+    bm, bn, bk, warps, stages = config
+    y = torch.empty(b, s, n, dtype=torch.float32, device=x.device)
+    m = b * s
+    _linear32_kernel[(triton.cdiv(m, bm), triton.cdiv(n, bn))](
+        x.contiguous(), w, m, y, N=n, K=k, BM=bm, BN=bn, BK=bk, num_warps=warps, num_stages=stages
+    )
+    return y
+
+
 # --- TensorRT plugins ---
 
 _COMPILED: dict = {}
@@ -475,10 +537,29 @@ def _compile(kind: str, tactic: int, dtype: str):
     return _COMPILED[key]
 
 
-def register_plugins(heads: int, head_dim: int) -> None:
-    """Define the TensorRT plugins (once per process) for a model with ``heads`` x ``head_dim``."""
+def _compile_linear(tactic: int, dtype: str):
+    """(name, PTX, warps, shared memory, rows per program, entries per program) of the logits32 kernel."""
+    n, k = _SHAPE["vocab"], _SHAPE["d_model"]
+    bm, bn, bk, warps, stages = LINEAR_TACTICS[max(tactic - 1, 0) % len(LINEAR_TACTICS)]
+    key = ("linear32", n, k, dtype, bm, bn, bk, warps, stages)
+    if key not in _COMPILED:
+        args = ["x", "w", "M", "y"]
+        consts = {"N": n, "K": k, "BM": bm, "BN": bn, "BK": bk}
+        signature = {"x": f"*{dtype}", "w": f"*{dtype}", "M": "i32", "y": "*fp32"} | dict.fromkeys(consts, "constexpr")
+        aligned = {(i,): [["tt.divisibility", 16]] for i, a in enumerate(args) if signature[a][0] == "*"}
+        src = triton.compiler.ASTSource(fn=_linear32_kernel, signature=signature, constexprs=consts, attrs=aligned)
+        kern = triton.compile(src, options={"num_warps": warps, "num_stages": stages})
+        unique = f"{kern.metadata.name}_{bm}_{bn}_{bk}_{warps}_{stages}"
+        ptx = kern.asm["ptx"].replace(kern.metadata.name, unique)
+        _COMPILED[key] = (unique, ptx, kern.metadata.num_warps, kern.metadata.shared, bm, bn)
+    return _COMPILED[key]
+
+
+def register_plugins(heads: int, head_dim: int, d_model: int = 0, vocab: int = 0) -> None:
+    """Define the TensorRT plugins (once per process) for a model with ``heads`` x ``head_dim`` (and, for
+    logits32, ``d_model`` and the vocabulary size)."""
     global _REGISTERED
-    _SHAPE.update(heads=heads, head_dim=head_dim)
+    _SHAPE.update(heads=heads, head_dim=head_dim, d_model=d_model, vocab=vocab)
     if _REGISTERED:
         return
     import tensorrt as trt
@@ -565,5 +646,28 @@ def register_plugins(heads: int, head_dim: int) -> None:
     @trtp.aot_impl(f"{NAMESPACE}::cross_attn_combine")
     def _combine_aot(part: Desc, q: Desc, outputs: Tuple[Desc], tactic: int) -> AOT:
         return launch("cross_combine", q, tactic, [q.shape_expr[1]])
+
+    @trtp.register(f"{NAMESPACE}::logits32")
+    def _logits_desc(x: Desc, w: Desc) -> Tuple[Desc]:
+        return (trtp.from_shape_expr((x.shape_expr[0], x.shape_expr[1], _SHAPE["vocab"]), trt.float32),)
+
+    @trtp.autotune(f"{NAMESPACE}::logits32")
+    def _logits_tune(x: Desc, w: Desc, outputs: Tuple[Desc]) -> Tune:
+        t = names[x.dtype][0]
+        tactics = range(1, len(LINEAR_TACTICS) + 1) if TUNE else [1]
+        return [trtp.AutoTuneCombination(f"{t}, {t}, FP32", "LINEAR", list(tactics))]
+
+    @trtp.aot_impl(f"{NAMESPACE}::logits32")
+    def _logits_aot(x: Desc, w: Desc, outputs: Tuple[Desc], tactic: int) -> AOT:
+        name, ptx, warps, shared, bm, bn = _compile_linear(tactic, names[x.dtype][1])
+        rows = x.shape_expr[0] * x.shape_expr[1]
+        params = trtp.KernelLaunchParams()
+        params.grid_x = trtp.cdiv(rows, bm)
+        params.grid_y = -(-_SHAPE["vocab"] // bn)
+        params.block_x = warps * 32
+        params.shared_mem = shared
+        args = trtp.SymIntExprs(1)
+        args[0] = trtp.SymInt32(rows)
+        return name, ptx, params, args
 
     _REGISTERED = True

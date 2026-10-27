@@ -82,3 +82,15 @@ def test_cross_split_triton(s):
         for combine in attn_plugin.TACTICS["cross_combine"]:
             out = attn_plugin.cross_attn_combine_triton(part, q, combine).float()
             assert (out - ref).abs().max() < 2e-2, (config, combine)
+
+
+@cuda
+@pytest.mark.parametrize("m", [1, 40, 160])
+def test_logits32_triton(m):
+    g = torch.Generator().manual_seed(4)
+    x = torch.randn(m, 1, 1280, generator=g).cuda().half()
+    w = (torch.randn(51866, 1280, generator=g) * 0.05).cuda().half()
+    ref = x.float() @ w.float().t()
+    for config in attn_plugin.LINEAR_TACTICS:
+        out = attn_plugin.logits32_triton(x, w, config)
+        assert (out - ref).abs().max() < 1e-3, config

@@ -32,7 +32,7 @@ from .search import cache_buckets
 log = logging.getLogger(__name__)
 
 # Bump whenever the exported graphs change, so that cached engines of older exports are not reused.
-EXPORT_VERSION = 4
+EXPORT_VERSION = 6
 DTYPES = {"float16": torch.float16, "bfloat16": torch.bfloat16}
 
 
@@ -55,6 +55,9 @@ class BuildOptions:
     ln32: bool = True
     gelu32_encoder: bool = True
     gelu32_decoder: bool = True
+    logits32: bool = False  # the decoder's vocabulary projection in fp32 (TF32 off)
+    # the vocabulary projection as a Triton plugin: fp16 inputs, fp32 accumulation (attn_plugin.logits32)
+    logits_plugin: bool = True
 
 
 class _EncoderGraph(nn.Module):
@@ -99,13 +102,13 @@ def _quiet_exporter():
 
 
 @contextmanager
-def _precision(ln32: bool, gelu32: bool):
-    saved = Precision.ln32, Precision.gelu32
-    Precision.ln32, Precision.gelu32 = ln32, gelu32
+def _precision(ln32: bool, gelu32: bool, logits32: bool = False):
+    saved = Precision.ln32, Precision.gelu32, Precision.logits32
+    Precision.ln32, Precision.gelu32, Precision.logits32 = ln32, gelu32, logits32
     try:
         yield
     finally:
-        Precision.ln32, Precision.gelu32 = saved
+        Precision.ln32, Precision.gelu32, Precision.logits32 = saved
 
 
 @contextmanager
@@ -162,10 +165,11 @@ def export_decoder_onnx(model: WhisperModel, path: Path, opts: BuildOptions, plu
         for layer in model.decoder.layers:
             layer.self_attn.fuse_qkv()
     model.decoder.plugins = frozenset(
-        ({"self", "cross"} | ({"cross_split"} if opts.cross_split else set())) if plugins else ()
+        ({"self", "cross"} | ({"cross_split"} if opts.cross_split else set())
+         | ({"logits"} if opts.logits_plugin else set())) if plugins else ()
     )
     try:
-        with _explicit_attention(), _precision(opts.ln32, opts.gelu32_decoder), _quiet_exporter():
+        with _explicit_attention(), _precision(opts.ln32, opts.gelu32_decoder, opts.logits32), _quiet_exporter():
             torch.onnx.export(
                 _DecoderGraph(model).eval(),
                 (tokens, offset, src, *caches),
@@ -204,6 +208,8 @@ def _build(
     config = builder.create_builder_config()
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, int(opts.workspace_gb * (1 << 30)))
     config.builder_optimization_level = opts.opt_level if opt_level is None else opt_level
+    if hasattr(trt.BuilderFlag, "TF32"):  # fp32 layers (logits32) in fp32, not TF32
+        config.clear_flag(trt.BuilderFlag.TF32)
     config.profiling_verbosity = trt.ProfilingVerbosity.DETAILED  # layer names for profiling; no runtime cost
     dynamic = {
         network.get_input(i).name for i in range(network.num_inputs) if -1 in tuple(network.get_input(i).shape)
@@ -263,7 +269,7 @@ def build_engines(model: WhisperModel, engine_dir: Path, opts: BuildOptions, kee
         log.warning("decoder engine without attention plugins (slower): %s",
                     attn_plugin.unavailable() or f"no kernels for head size {cfg.head_dim}")
     if plugins:
-        attn_plugin.register_plugins(cfg.dec_heads, cfg.head_dim)
+        attn_plugin.register_plugins(cfg.dec_heads, cfg.head_dim, cfg.d_model, cfg.vocab_size)
     dec_onnx = export_decoder_onnx(model, onnx_dir / "decoder" / "decoder.onnx", opts, plugins)
     log.warning("exported ONNX in %.0fs", time.time() - t0)
     enc = encoder_profiles(opts)

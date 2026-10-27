@@ -88,6 +88,7 @@ class Precision:
     # The MLPs' GELU: TensorRT's fp16 erf multiplied the encoder's error by 5 (scripts/encoder_variants.py)
     gelu32 = True
     residual32 = False  # the encoder's residual stream
+    logits32 = False  # the decoder's vocabulary projection
 
 
 def gelu(x: torch.Tensor) -> torch.Tensor:
@@ -171,6 +172,10 @@ class Decoder(nn.Module):
         return torch.stack(kv)
 
     def logits(self, x: torch.Tensor) -> torch.Tensor:
+        if "logits" in self.plugins:  # fp16 inputs, fp32 accumulation (attn_plugin.logits32)
+            return attn_plugin.logits32(self.layer_norm(x), self.embed_tokens.weight)
+        if Precision.logits32:  # (the vocabulary projection in fp32: the scores beam search compares)
+            return self.layer_norm(x).float() @ self.embed_tokens.weight.float().t()
         return (self.layer_norm(x) @ self.embed_tokens.weight.t()).float()
 
     def step(

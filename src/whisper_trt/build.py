@@ -39,10 +39,12 @@ DTYPES = {"float16": torch.float16, "bfloat16": torch.bfloat16}
 @dataclass(frozen=True)
 class BuildOptions:
     dtype: str = "float16"
-    max_batch: int = 16  # windows per encoder call / per decoding
-    max_rows: int = 80  # decoder rows per call (windows x beams)
+    max_batch: int = 32  # windows per encoder call / per decoding
+    max_rows: int = 160  # decoder rows per call (windows x beams)
     capacity: int = 448  # decoder positions (KV-cache slots)
-    max_prefill: int = 256  # longest prompt (with previous text) in one call
+    # longest prompt in one call (the scratch memory of every decoder context grows with rows x prompt tokens;
+    # prompts with previous text would need up to 224)
+    max_prefill: int = 32
     workspace_gb: float = 8.0
     opt_level: int = 3
     attn_plugin: bool = True  # decoder attention as Triton plugins (needs Triton at build time only)
@@ -231,8 +233,8 @@ def decoder_profiles(opts: BuildOptions) -> list[dict]:
     R, W = opts.max_rows, opts.max_batch
     return [
         {"kind": "decode", "batch": (1, 1, 1), "windows": (1, 1, 1), "seq": (1, 1, 1)},
-        {"kind": "decode", "batch": (2, 40, R), "windows": (1, 8, W), "seq": (1, 1, 1)},
-        {"kind": "prefill", "batch": (1, 8, R), "windows": (1, 8, W), "seq": (1, 4, opts.max_prefill)},
+        {"kind": "decode", "batch": (2, max(2, R // 2), R), "windows": (1, max(1, W // 2), W), "seq": (1, 1, 1)},
+        {"kind": "prefill", "batch": (1, 5, R), "windows": (1, 1, W), "seq": (1, 3, opts.max_prefill)},
     ]
 
 

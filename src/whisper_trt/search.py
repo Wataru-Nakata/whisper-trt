@@ -274,16 +274,15 @@ class Search:
     # --- driver -----------------------------------------------------------------------------------------
     def _start(self, slots: list[int], prompts: list[list[int]], prefill: Callable) -> torch.Tensor:
         """Load windows into ``slots``: each prompt but its last token prefilled into the slot's rows (one call
-        per run of consecutive slots), the last one fed by the next step; returns the windows' no-speech
-        probabilities [len(slots)] (on the device)."""
+        for all slots at the first fill, else one per slot), the last one fed by the next step; returns the
+        windows' no-speech probabilities [len(slots)] (on the device)."""
         K, P, dev = self.K, self.P, self.device
         order = sorted(range(len(slots)), key=lambda i: slots[i])
         no_speech = torch.empty(len(slots), device=dev)
         i = 0
-        while i < len(order):  # runs of consecutive slots
-            j = i + 1
-            while j < len(order) and slots[order[j]] == slots[order[j - 1]] + 1:
-                j += 1
+        whole = sorted(slots) == list(range(self.B))  # the first fill: one call for all slots
+        while i < len(order):  # (refills: one call per slot, so that a Search needs at most B + 1 contexts)
+            j = len(order) if whole else i + 1
             a, b = slots[order[i]], slots[order[j - 1]] + 1
             rows = slice(a * K, b * K)
             tokens = torch.tensor([prompts[order[k]][:-1] for k in range(i, j) for _ in range(K)], device=dev)

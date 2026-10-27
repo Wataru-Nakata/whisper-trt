@@ -71,7 +71,8 @@ def decisions(row: dict, max_new: int = 224) -> dict:
             "fallback": not silence and (cr > 2.4 or lp < -1.0), "limit": n >= max_new}
 
 
-def compare(rows: list[dict], run: dict, meta: list[dict], rkey: str, have_text: bool, report: dict) -> str:
+def compare(rows: list[dict], run: dict, meta: list[dict], rkey: str, have_text: bool, report: dict,
+            key: str = "") -> str:
     rr = run["rows"]
     n = len(rr)
     same = [a["tokens"] == b["tokens"] for a, b in zip(rows, rr)]
@@ -93,7 +94,7 @@ def compare(rows: list[dict], run: dict, meta: list[dict], rkey: str, have_text:
         err = sum(edit_distance(chars(rows[i]["text"]), chars(rr[i]["text"])) for i in diff)
         tot = sum(len(chars(rr[i]["text"])) for i in diff)
         line += f"\n      differing windows: {len(diff)}, their character difference {err / max(1, tot):.2%}"
-    report[rkey] = [{"i": i, "id": meta[i].get("id"), "ours": rows[i]["text"], "ref": rr[i]["text"],
+    report[f"{key} vs {rkey}"] = [{"i": i, "id": meta[i].get("id"), "ours": rows[i]["text"], "ref": rr[i]["text"],
                      "len": [len(rows[i]["tokens"]), len(rr[i]["tokens"])],
                      "ours_decisions": da[i], "ref_decisions": db[i]} for i in diff]
     return line
@@ -126,7 +127,9 @@ def main() -> None:
     audio_s = sum(len(w) for w in waves) / 16000
     ref = json.load(open(args.ref))
     t0 = time.perf_counter()
-    model = Whisper.from_pretrained(args.model, backend=args.backend, dtype=args.dtype, **build_options(args.build))
+    opts = build_options(args.build)
+    sizes = {k: opts.pop(k) for k in ("max_batch", "max_rows") if k in opts}
+    model = Whisper.from_pretrained(args.model, backend=args.backend, dtype=args.dtype, **sizes, **opts)
     print(f"loaded {args.backend}/{args.dtype} in {time.perf_counter() - t0:.1f}s", flush=True)
 
     feats_path = Path(args.ref.replace(".json", "-features.npz"))
@@ -163,15 +166,16 @@ def main() -> None:
             times.append(time.perf_counter() - t0)
         best = min(times[1:]) if len(times) > 1 else times[0]
         key = f"beam{beam}/b{batch}" + ("/stream" if args.stream else "")
+        peak = torch.cuda.max_memory_allocated() / 2**30
         out[key] = {"rows": rows, "seconds": times, "rtfx": audio_s / best}
         have_text = any(m["text"] for m in meta)
-        line = f"{key}: RTFx {audio_s / best:.1f}"
+        line = f"{key}: RTFx {audio_s / best:.1f} (peak GPU memory so far {peak:.1f} GiB)"
         if have_text:
             line += f", {'CER' if UNITS is chars else 'WER'} {wer([r['text'] for r in rows], [m['text'] for m in meta]):.2%}"
         for rkey, run in ref["runs"].items():
             if f"/beam{beam}/" not in rkey:
                 continue
-            line += "\n" + compare(rows, run, meta, rkey, have_text, report)
+            line += "\n" + compare(rows, run, meta, rkey, have_text, report, key)
         print(line, flush=True)
     if args.out:
         json.dump(out, open(args.out, "w"), ensure_ascii=False, indent=1)

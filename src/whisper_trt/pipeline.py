@@ -69,11 +69,9 @@ class Whisper:
         self.device = torch.device("cuda")
         self.stream = torch.cuda.Stream(priority=-1)  # (decoding first)
         self.side_stream = torch.cuda.Stream(priority=0)  # windows encoded ahead (_Prefetch)
-        L, H, T, dk = cfg.dec_layers, cfg.dec_heads, cfg.enc_frames, cfg.head_dim
-        self._cross_flat = torch.empty(L * 2 * max_batch * H * T * dk, dtype=backend.dtype, device=self.device)
+        self._cross_flat = torch.empty(0, dtype=backend.dtype, device=self.device)  # (grown on demand: cross)
         self._searches: dict[tuple, Search] = {}
         self._prefills: dict[tuple, tuple] = {}
-        self._stage_flat: torch.Tensor | None = None
 
     @classmethod
     def from_pretrained(
@@ -81,8 +79,8 @@ class Whisper:
         name: str = "openai/whisper-large-v3",
         backend: str = "tensorrt",
         dtype: str = "float16",
-        max_batch: int = 16,
-        max_rows: int = 80,
+        max_batch: int = 32,
+        max_rows: int = 160,
         cache_dir: str | None = None,
         **build_options,
     ) -> "Whisper":
@@ -109,13 +107,23 @@ class Whisper:
         return log_mel(waves, self.cfg.n_mels, self.device, N_FRAMES)
 
     def cross(self, windows: int) -> torch.Tensor:
-        """The cross-attention buffer [L, 2, W, H, T, d_k] for ``windows`` windows (one buffer for all W)."""
+        """The cross-attention buffer [L, 2, W, H, T, d_k] for ``windows`` windows (one buffer for all W, grown
+        to the most windows asked for: 245 MB each for large-v3; growing drops the searches bound to it)."""
         c = self.cfg
         shape = (c.dec_layers, 2, windows, c.dec_heads, c.enc_frames, c.head_dim)
-        return self._cross_flat[: int(np.prod(shape))].view(shape)
+        n = int(np.prod(shape))
+        if n > self._cross_flat.numel():
+            self._searches.clear()
+            self._prefills.clear()
+            self._cross_flat = torch.empty(0, dtype=self.backend.dtype, device=self.device)
+            torch.cuda.empty_cache()
+            self._cross_flat = torch.empty(n, dtype=self.backend.dtype, device=self.device)
+        return self._cross_flat[:n].view(shape)
 
     @_on_stream
     def encode(self, feats: torch.Tensor) -> torch.Tensor:
+        """Every decoder layer's cross-attention keys/values of the windows' features, as a view of the model's
+        buffer (valid until a call with more windows grows it)."""
         if feats.shape[0] > self.max_batch:
             raise ValueError(f"at most {self.max_batch} windows per call")
         cross = self.cross(feats.shape[0])
@@ -155,14 +163,6 @@ class Whisper:
         """A Search's prefill of the rows of consecutive slots (see Search.stream)."""
         key = ("prefill", windows, slots.start, slots.stop, *tokens.shape, cache.data_ptr())
         return self._decoder(key, tokens, cache, src, self.cross(windows)[:, :, slots])
-
-    def _staging(self, windows: int) -> torch.Tensor:
-        """A second cross-attention buffer, for windows encoded before they are copied into their slots."""
-        c = self.cfg
-        shape = (c.dec_layers, 2, windows, c.dec_heads, c.enc_frames, c.head_dim)
-        if self._stage_flat is None:
-            self._stage_flat = torch.empty_like(self._cross_flat)
-        return self._stage_flat[: int(np.prod(shape))].view(shape)
 
     def prompt(
         self,
@@ -240,7 +240,7 @@ class Whisper:
             raise ValueError(f"at most {self.max_batch} windows at a time")
         search = self._search(mode, slots, rows, len(prompt))
         cross = self.cross(slots)
-        ahead = _Prefetch(self, audio, ring=min(slots, len(audio) - slots))
+        ahead = _Prefetch(self, audio, ring=min(slots, len(audio) - slots, 8))
 
         def load(slot_ids: list[int], windows: list[int]) -> None:
             if slot_ids == list(range(slots)) and windows == list(range(slots)):  # the first windows: at once

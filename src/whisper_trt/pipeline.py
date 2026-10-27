@@ -82,12 +82,13 @@ class Whisper:
         max_batch: int = 32,
         max_rows: int = 160,
         cache_dir: str | None = None,
-        decoder: str = "triton",
+        decoder: str | None = None,
         **build_options,
     ) -> "Whisper":
         """``backend="tensorrt"``: the TensorRT encoder, and a decoder step of cuBLAS GEMMs and Triton kernels
         (``decoder="triton"``, runtime.TritonDecoderBackend: float16; only the encoder engine is built) or the
-        TensorRT decoder engine (``decoder="tensorrt"``: slower, and its GEMMs accumulate less precisely)."""
+        TensorRT decoder engine (``decoder="tensorrt"``: slower, and its GEMMs accumulate less precisely).
+        ``decoder=None``: "triton" for float16, else "tensorrt"."""
         model_dir = hub.resolve(name)
         cfg = load_config(model_dir)
         tokenizer = Tokenizer(model_dir, cfg)
@@ -96,6 +97,8 @@ class Whisper:
             return cls(cfg, tokenizer, TorchBackend(model), model, max_batch)
         if backend != "tensorrt":
             raise ValueError(f"backend must be 'tensorrt' or 'torch', got {backend!r}")
+        if decoder is None:
+            decoder = "triton" if dtype == "float16" else "tensorrt"
         if decoder not in ("tensorrt", "triton"):
             raise ValueError(f"decoder must be 'tensorrt' or 'triton', got {decoder!r}")
         if decoder == "triton" and dtype != "float16":

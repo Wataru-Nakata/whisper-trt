@@ -67,7 +67,8 @@ class Whisper:
         self.model = model  # the PyTorch model (torch backend, word timestamps)
         self.max_batch = max_batch
         self.device = torch.device("cuda")
-        self.stream = torch.cuda.Stream()
+        self.stream = torch.cuda.Stream(priority=-1)  # (decoding first)
+        self.side_stream = torch.cuda.Stream(priority=0)  # windows encoded ahead (_Prefetch)
         L, H, T, dk = cfg.dec_layers, cfg.dec_heads, cfg.enc_frames, cfg.head_dim
         self._cross_flat = torch.empty(L * 2 * max_batch * H * T * dk, dtype=backend.dtype, device=self.device)
         self._searches: dict[tuple, Search] = {}
@@ -239,12 +240,16 @@ class Whisper:
             raise ValueError(f"at most {self.max_batch} windows at a time")
         search = self._search(mode, slots, rows, len(prompt))
         cross = self.cross(slots)
+        ahead = _Prefetch(self, audio, ring=min(slots, len(audio) - slots))
 
         def load(slot_ids: list[int], windows: list[int]) -> None:
-            feats = self.features([audio[w] for w in windows])
-            stage = self._staging(len(windows))
-            self.backend.encode(feats, stage)
-            cross[:, :, torch.tensor(slot_ids, device=self.device)] = stage
+            if slot_ids == list(range(slots)) and windows == list(range(slots)):  # the first windows: at once
+                self.backend.encode(self.features([audio[w] for w in windows]), cross)
+                ahead.skip_to(slots)
+            else:
+                for s_, w in zip(slot_ids, windows):
+                    ahead.take(w, cross[:, :, s_])
+            ahead.top_up()
 
         suppress = self.tokenizer.suppressed_tokens(suppress_tokens)
         begin = self.cfg.begin_suppress_tokens if suppress_blank else ()
@@ -321,6 +326,53 @@ class Whisper:
             best = max(ok or attempts[i], key=lambda a: a["avg_logprob"])
             final[i] = _decoded({**best, "temperature": attempts[i][-1]["temperature"]}, attempts[i])
         return final
+
+
+class _Prefetch:
+    """The next windows of a :meth:`Whisper.decode`, encoded ahead on a stream of their own (while the decoder
+    steps run, which leave much of the GPU idle) into a ring of one-window buffers; ``take`` copies one into a
+    slot when the slot is free."""
+
+    def __init__(self, model: "Whisper", audio: list, ring: int):
+        c = model.cfg
+        self.model, self.audio = model, audio
+        shape = (c.dec_layers, 2, 1, c.dec_heads, c.enc_frames, c.head_dim)
+        self.bufs = [torch.empty(shape, dtype=model.backend.dtype, device=model.device) for _ in range(ring)]
+        self.free = list(range(ring))
+        self.copied: list = [None] * ring  # event after a buffer's copy into its slot (the model's stream)
+        self.staged: dict[int, tuple[int, torch.cuda.Event]] = {}  # window -> (buffer, encoded event)
+        self.next = 0  # the next window to encode
+
+    def skip_to(self, window: int) -> None:
+        self.next = window
+
+    def top_up(self) -> None:
+        """Encode the next windows into the free buffers, one at a time, on the side stream."""
+        m = self.model
+        while self.free and self.next < len(self.audio):
+            b, w = self.free.pop(0), self.next
+            self.next += 1
+            with torch.cuda.stream(m.side_stream):
+                if self.copied[b] is not None:
+                    m.side_stream.wait_event(self.copied[b])
+                a = self.audio[w]
+                wave = a if isinstance(a, torch.Tensor) and a.dim() == 1 else load_audio(a)
+                m.backend.encode(log_mel([wave], m.cfg.n_mels, m.device, N_FRAMES), self.bufs[b], lane=1)
+                done = torch.cuda.Event()
+                done.record()
+            self.staged[w] = (b, done)
+
+    def take(self, window: int, slot: torch.Tensor) -> None:
+        """Window ``window``'s keys/values into ``slot`` (a [L, 2, H, T, d_k] view), on the current stream."""
+        if window not in self.staged:  # (not encoded ahead: the ring was full)
+            self.top_up()
+        b, done = self.staged.pop(window)
+        stream = torch.cuda.current_stream()
+        stream.wait_event(done)
+        slot.copy_(self.bufs[b][:, :, 0])
+        self.copied[b] = torch.cuda.Event()
+        self.copied[b].record(stream)
+        self.free.append(b)
 
 
 def _needs_fallback(d: dict, cr: float | None, lp: float | None, ns: float | None) -> bool:

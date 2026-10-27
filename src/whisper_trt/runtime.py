@@ -30,7 +30,7 @@ class TorchBackend:
         self.cfg = model.cfg
         self.dtype = model.decoder.embed_tokens.weight.dtype
 
-    def encode(self, feats: torch.Tensor, cross: torch.Tensor) -> None:
+    def encode(self, feats: torch.Tensor, cross: torch.Tensor, lane: int = 0) -> None:
         with torch.inference_mode():
             enc = self.model.encoder(feats)
             cross.copy_(self.model.decoder.cross_kv(enc))
@@ -104,15 +104,16 @@ class TRTBackend:
             raise RuntimeError(f"failed to deserialize {path}; rebuild it with `whisper-trt build`")
         return engine
 
-    def _context(self, engine, profile: int):
-        # Every context of an engine shares one scratch buffer: they run on one stream, one at a time.
+    def _context(self, engine, profile: int, lane: int = 0):
+        # Every context of an engine and lane shares one scratch buffer: they run on one stream, one at a time.
+        # Contexts of another lane may run at the same time (on a stream of their own): scratch of their own.
         ctx = engine.create_execution_context(self.trt.ExecutionContextAllocationStrategy.USER_MANAGED)
         if ctx is None:
             raise RuntimeError(f"TensorRT failed to create an execution context (profile {profile})")
-        key = id(engine)
-        if key not in self._scratch:
-            self._scratch[key] = torch.empty(max(engine.device_memory_size_v2, 1), dtype=torch.uint8,
-                                             device="cuda")
+        key = (id(engine), lane) if lane == 0 else (id(engine), lane, profile)
+        if key not in self._scratch:  # (another lane: only what its profile needs, e.g. 256 MB for one window)
+            size = engine.device_memory_size_v2 if lane == 0 else engine.get_device_memory_size_for_profile_v2(profile)
+            self._scratch[key] = torch.empty(max(size, 1), dtype=torch.uint8, device="cuda")
         scratch = self._scratch[key]
         ctx.set_device_memory(scratch.data_ptr(), scratch.numel())
         stream = torch.cuda.current_stream()
@@ -139,12 +140,13 @@ class TRTBackend:
                 return i
         raise ValueError(f"no {kind} profile covers {rows} rows")
 
-    def encode(self, feats: torch.Tensor, cross: torch.Tensor) -> None:
+    def encode(self, feats: torch.Tensor, cross: torch.Tensor, lane: int = 0) -> None:
+        """``lane``: contexts of their own, for encodes that may run alongside others (see _context)."""
         w = feats.shape[0]
         i = self._profile("encoder", w)
-        if i not in self._enc_ctxs:
-            self._enc_ctxs[i] = self._context(self.encoder, i)
-        ctx = self._enc_ctxs[i]
+        if (i, lane) not in self._enc_ctxs:
+            self._enc_ctxs[i, lane] = self._context(self.encoder, i, lane)
+        ctx = self._enc_ctxs[i, lane]
         feats = feats.contiguous()
         self._bind(ctx, "feats", feats, True)
         self._bind(ctx, "cross_kv", cross, False)

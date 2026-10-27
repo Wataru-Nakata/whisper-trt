@@ -17,7 +17,7 @@ def build_options(items: list[str]) -> dict:
     out = {}
     for item in items:
         k, v = item.split("=", 1)
-        out[k] = v.lower() == "true" if v.lower() in ("true", "false") else int(v)
+        out[k] = v.lower() == "true" if v.lower() in ("true", "false") else int(v) if v.lstrip("-").isdigit() else v
     return out
 
 

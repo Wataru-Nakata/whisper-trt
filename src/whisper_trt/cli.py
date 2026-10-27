@@ -15,6 +15,8 @@ def main(argv: list[str] | None = None) -> None:
         p.add_argument("--model", default="openai/whisper-large-v3")
         p.add_argument("--backend", default="tensorrt", choices=("tensorrt", "torch"))
         p.add_argument("--max-batch", type=int, default=16)
+        p.add_argument("--decoder", default="triton", choices=("triton", "tensorrt"),
+                       help="triton: cuBLAS GEMMs + Triton kernels (default); tensorrt: the TensorRT decoder engine")
     for p in (t, d):
         p.add_argument("audio", nargs="+")
         p.add_argument("--batch-size", type=int, default=8)
@@ -26,7 +28,7 @@ def main(argv: list[str] | None = None) -> None:
 
     from . import Whisper
 
-    model = Whisper.from_pretrained(args.model, backend=args.backend, max_batch=args.max_batch)
+    model = Whisper.from_pretrained(args.model, backend=args.backend, max_batch=args.max_batch, decoder=args.decoder)
     if args.cmd == "build":
         print("engines ready", file=sys.stderr)
     elif args.cmd == "transcribe":

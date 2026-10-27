@@ -47,7 +47,7 @@ def main() -> None:
     data = np.load(args.waves)
     from profile_decode import build_options
 
-    model = Whisper.from_pretrained(args.model, **build_options(args.build))
+    model = Whisper.from_pretrained(args.model, decoder="tensorrt", **build_options(args.build))
     be, cfg = model.backend, model.cfg
     L, H, dk, V = cfg.dec_layers, cfg.dec_heads, cfg.head_dim, cfg.vocab_size
     with torch.cuda.stream(model.stream):
@@ -86,6 +86,15 @@ def main() -> None:
                   f"{len(prof.times)} layers", flush=True)
             for k, v in sorted(by.items(), key=lambda x: -x[1]):
                 print(f"   {k}: {v:.3f} ms ({v / total:.0%})")
+                if k in ("cast/copy/reformat", "other", "gelu"):  # what they are: layer-0 names (numbers dropped)
+                    names = defaultdict(lambda: [0.0, 0])
+                    for name, ms in prof.times.items():
+                        if kind(name) == k:
+                            key = re.sub(r"_\d+", "", name)[:140]
+                            names[key][0] += ms / reps
+                            names[key][1] += 1
+                    for name, (ms, c) in sorted(names.items(), key=lambda x: -x[1][0])[:6]:
+                        print(f"        {ms:.3f} ms {c:3d}x  {name}")
             top = sorted(prof.times.items(), key=lambda x: -x[1])[:12]
             for name, ms in top:
                 print(f"     {ms / reps:.4f} ms  {name[:150]}")

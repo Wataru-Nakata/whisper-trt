@@ -35,7 +35,7 @@ def main() -> None:
     meta = json.loads(str(data["meta"]))
     waves = [torch.from_numpy(data[f"w{i}"]) for i in range(min(args.n, len(meta)))]
 
-    trt = Whisper.from_pretrained(args.model, backend="tensorrt")
+    trt = Whisper.from_pretrained(args.model, backend="tensorrt", decoder="tensorrt")
     from whisper_trt import hub
 
     ref = load_model(hub.resolve(args.model), trt.cfg, dtype=torch.float32)

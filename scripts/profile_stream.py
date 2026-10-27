@@ -24,6 +24,7 @@ def main() -> None:
     ap.add_argument("--batch", nargs="+", type=int, default=[8, 16, 32])
     ap.add_argument("--beam", type=int, default=5)
     ap.add_argument("--schedules", nargs="+", default=["1,1"])
+    ap.add_argument("--decoder", default="tensorrt", choices=("tensorrt", "triton"))
     args = ap.parse_args()
     data = np.load(args.waves)
     meta = json.loads(str(data["meta"]))
@@ -32,7 +33,7 @@ def main() -> None:
         w = data[f"w{i}"]
         waves.append(torch.from_numpy(w.astype(np.float32) / 32768 if w.dtype == np.int16 else w))
     audio_s = sum(len(w) for w in waves) / 16000
-    model = Whisper.from_pretrained()
+    model = Whisper.from_pretrained(decoder=args.decoder)
     prompt = model.prompt(args.lang)
     for batch in args.batch:
         model.decode(waves[: batch * 2], prompt, beam_size=args.beam, batch_size=batch)  # warm-up / capture

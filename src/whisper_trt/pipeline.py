@@ -14,7 +14,7 @@ from .audio import AudioLike, load_audio
 from .config import N_FRAMES, WhisperConfig, load_config
 from .features import log_mel
 from .modeling import load_model
-from .runtime import TorchBackend, TRTBackend
+from .runtime import TorchBackend, TritonDecoderBackend, TRTBackend
 from .search import Search, WindowResult
 from .tokenizer import Tokenizer
 
@@ -82,8 +82,12 @@ class Whisper:
         max_batch: int = 32,
         max_rows: int = 160,
         cache_dir: str | None = None,
+        decoder: str = "triton",
         **build_options,
     ) -> "Whisper":
+        """``backend="tensorrt"``: the TensorRT encoder, and a decoder step of cuBLAS GEMMs and Triton kernels
+        (``decoder="triton"``, runtime.TritonDecoderBackend: float16; only the encoder engine is built) or the
+        TensorRT decoder engine (``decoder="tensorrt"``: slower, and its GEMMs accumulate less precisely)."""
         model_dir = hub.resolve(name)
         cfg = load_config(model_dir)
         tokenizer = Tokenizer(model_dir, cfg)
@@ -92,11 +96,21 @@ class Whisper:
             return cls(cfg, tokenizer, TorchBackend(model), model, max_batch)
         if backend != "tensorrt":
             raise ValueError(f"backend must be 'tensorrt' or 'torch', got {backend!r}")
+        if decoder not in ("tensorrt", "triton"):
+            raise ValueError(f"decoder must be 'tensorrt' or 'triton', got {decoder!r}")
+        if decoder == "triton" and dtype != "float16":
+            raise ValueError("the Triton decoder runs float16")
         from .build import BuildOptions, ensure_engines
 
         opts = BuildOptions(dtype=dtype, max_batch=max_batch, max_rows=max_rows, **build_options)
-        engine_dir = ensure_engines(model_dir, cfg, opts, cache_dir)
-        return cls(cfg, tokenizer, TRTBackend(cfg, engine_dir), None, max_batch)
+        engine_dir = ensure_engines(model_dir, cfg, opts, cache_dir, decoder=decoder == "tensorrt")
+        trt_backend = TRTBackend(cfg, engine_dir, decoder=decoder == "tensorrt")
+        if decoder == "tensorrt":
+            return cls(cfg, tokenizer, trt_backend, None, max_batch)
+        model = load_model(model_dir, cfg, device="cpu", dtype=torch.float16)
+        del model.encoder
+        backend_ = TritonDecoderBackend(model.to("cuda"), trt_backend)
+        return cls(cfg, tokenizer, backend_, None, max_batch)
 
     # --- building blocks --------------------------------------------------------------------------------
     @_on_stream
@@ -155,7 +169,8 @@ class Whisper:
         fn, buf, logits, new_kv = self._prefills[key]
         buf.copy_(tokens)
         fn()
-        cache[..., :p, :] = new_kv
+        if not getattr(fn, "writes_cache", False):
+            cache[..., :p, :] = new_kv
         return logits
 
     def prompt(

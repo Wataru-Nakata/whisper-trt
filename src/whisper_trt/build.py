@@ -258,29 +258,36 @@ def decoder_profile_shapes(cfg: WhisperConfig, opts: BuildOptions, prof: dict) -
     return shapes
 
 
-def build_engines(model: WhisperModel, engine_dir: Path, opts: BuildOptions, keep_onnx: bool = False) -> None:
+def build_engines(model: WhisperModel, engine_dir: Path, opts: BuildOptions, keep_onnx: bool = False,
+                  parts: tuple[str, ...] = ("encoder", "decoder")) -> None:
+    """Export and build ``parts`` into ``engine_dir`` (build.json: the options and every engine's profiles,
+    written last)."""
     cfg = model.cfg
     engine_dir.mkdir(parents=True, exist_ok=True)
     onnx_dir = engine_dir / "onnx"
     t0 = time.time()
-    enc_onnx = export_encoder_onnx(model, onnx_dir / "encoder" / "encoder.onnx", opts)
-    plugins = opts.attn_plugin and attn_plugin.available(cfg.head_dim)
-    if opts.attn_plugin and not plugins:
-        log.warning("decoder engine without attention plugins (slower): %s",
-                    attn_plugin.unavailable() or f"no kernels for head size {cfg.head_dim}")
-    if plugins:
-        attn_plugin.register_plugins(cfg.dec_heads, cfg.head_dim, cfg.d_model, cfg.vocab_size)
-    dec_onnx = export_decoder_onnx(model, onnx_dir / "decoder" / "decoder.onnx", opts, plugins)
-    log.warning("exported ONNX in %.0fs", time.time() - t0)
-    enc = encoder_profiles(opts)
-    _build(enc_onnx, engine_dir / "encoder.engine",
-           [{"feats": tuple((n, cfg.n_mels, N_FRAMES) for n in p["batch"])} for p in enc], opts)
-    dec = decoder_profiles(opts)
-    _build(dec_onnx, engine_dir / "decoder.engine", [decoder_profile_shapes(cfg, opts, p) for p in dec], opts,
-           opts.decoder_opt_level)
-    meta = {"options": asdict(opts), "config": asdict(cfg), "profiles": {"encoder": enc, "decoder": dec},
-            "attn_plugin": plugins}
-    (engine_dir / "build.json").write_text(json.dumps(meta, indent=1))
+    enc, dec = encoder_profiles(opts), decoder_profiles(opts)
+    meta_path = engine_dir / "build.json"
+    meta = json.loads(meta_path.read_text()) if meta_path.exists() else {
+        "options": asdict(opts), "config": asdict(cfg), "profiles": {"encoder": enc, "decoder": dec}}
+    if "encoder" in parts:
+        enc_onnx = export_encoder_onnx(model, onnx_dir / "encoder" / "encoder.onnx", opts)
+        log.warning("exported the encoder's ONNX in %.0fs", time.time() - t0)
+        _build(enc_onnx, engine_dir / "encoder.engine",
+               [{"feats": tuple((n, cfg.n_mels, N_FRAMES) for n in p["batch"])} for p in enc], opts)
+    if "decoder" in parts:
+        plugins = opts.attn_plugin and attn_plugin.available(cfg.head_dim)
+        if opts.attn_plugin and not plugins:
+            log.warning("decoder engine without attention plugins (slower): %s",
+                        attn_plugin.unavailable() or f"no kernels for head size {cfg.head_dim}")
+        if plugins:
+            attn_plugin.register_plugins(cfg.dec_heads, cfg.head_dim, cfg.d_model, cfg.vocab_size)
+        dec_onnx = export_decoder_onnx(model, onnx_dir / "decoder" / "decoder.onnx", opts, plugins)
+        tmp = engine_dir / "decoder.engine.tmp"
+        _build(dec_onnx, tmp, [decoder_profile_shapes(cfg, opts, p) for p in dec], opts, opts.decoder_opt_level)
+        tmp.rename(engine_dir / "decoder.engine")
+        meta["attn_plugin"] = plugins
+    meta_path.write_text(json.dumps(meta, indent=1))
     if not keep_onnx:
         shutil.rmtree(onnx_dir, ignore_errors=True)
 
@@ -312,13 +319,27 @@ def model_name(model_dir: Path) -> str:
 
 
 def ensure_engines(
-    model_dir: Path, cfg: WhisperConfig, opts: BuildOptions, cache_dir: str | Path | None = None
+    model_dir: Path, cfg: WhisperConfig, opts: BuildOptions, cache_dir: str | Path | None = None,
+    decoder: bool = True,
 ) -> Path:
-    """The engine directory for this checkpoint and options, built if missing."""
+    """The engine directory for this checkpoint and options, built if missing (``decoder=False``: the encoder
+    engine only; the decoder engine is added to the directory when a later call needs it)."""
     engine_dir = cache_root(cache_dir) / model_name(model_dir) / engine_tag(opts)
     meta = engine_dir / "build.json"
-    if meta.exists():
+    if meta.exists() and (not decoder or (engine_dir / "decoder.engine").exists()):
         return engine_dir
+    log.warning("building TensorRT engines into %s (first use; this takes several minutes)", engine_dir)
+    model = load_model(model_dir, cfg, dtype=DTYPES[opts.dtype])
+    if meta.exists():  # the decoder engine for an encoder-only build
+        build_engines(model, engine_dir, opts, parts=("decoder",))
+    else:
+        tmp = engine_dir.with_name(engine_dir.name + ".tmp")
+        shutil.rmtree(tmp, ignore_errors=True)
+        build_engines(model, tmp, opts, parts=("encoder", "decoder") if decoder else ("encoder",))
+        tmp.rename(engine_dir)
+    del model
+    torch.cuda.empty_cache()
+    return engine_dir
     log.warning("building TensorRT engines into %s (first use; this takes several minutes)", engine_dir)
     model = load_model(model_dir, cfg, dtype=DTYPES[opts.dtype])
     tmp = engine_dir.with_name(engine_dir.name + ".tmp")

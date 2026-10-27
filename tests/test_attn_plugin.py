@@ -48,6 +48,29 @@ def test_self_attn_triton(s):
 
 
 @cuda
+@pytest.mark.parametrize("config", [None, (16, 1), (32, 2), (64, 4)])
+def test_self_attn_step_triton(config):
+    qkv, kc, vc, offset, src = _case(b=10, s=1, h=20, c=96, dtype=torch.float16, device="cuda")
+    offset[0] = 0  # (only the new token)
+    ref = attn_plugin.self_attn(qkv.float(), kc.float(), vc.float(), offset, src)
+    out = attn_plugin.self_attn_step_triton(qkv, kc, vc, offset, src, config).float()
+    assert (out - ref).abs().max() < 2e-3
+    # writing the new keys/values: as in a decoding step, no row reads a slot that is written (rows read below
+    # their offset; give them all the same one)
+    offset.fill_(40)
+    out = attn_plugin.self_attn_step_triton(qkv, kc, vc, offset, src, config).float()
+    k2, v2 = kc.clone(), vc.clone()
+    again = attn_plugin.self_attn_step_triton(qkv, k2, v2, offset, src, config, write_cache=True).float()
+    assert torch.equal(again, out)
+    new_k, new_v = qkv.view(10, 3, 20, 64)[:, 1], qkv.view(10, 3, 20, 64)[:, 2]
+    for r in range(10):
+        o = int(offset[r])
+        k_exp, v_exp = kc[r].clone(), vc[r].clone()
+        k_exp[:, o], v_exp[:, o] = new_k[r], new_v[r]
+        assert torch.equal(k2[r], k_exp) and torch.equal(v2[r], v_exp)
+
+
+@cuda
 @pytest.mark.parametrize("s", [1, 5, 20])
 def test_cross_attn_triton(s):
     g = torch.Generator().manual_seed(1)

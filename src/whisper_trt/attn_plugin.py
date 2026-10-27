@@ -307,6 +307,49 @@ if triton is not None:
         tl.store(out, (acc / l_i[:, None]).to(y.dtype.element_ty), mask=sm)
 
     @triton.jit
+    def _self_attn_step_kernel(qkv, kc, vc, offs, src, C, y,
+                               H: tl.constexpr, D: tl.constexpr, BN: tl.constexpr, QK_SCALE: tl.constexpr,
+                               WRITE: tl.constexpr):  # fmt: skip
+        """:func:`_self_attn_kernel` for one new token per row (a decoding step): one query per (row, head),
+        no 16-row tile, the products and probabilities in fp32 (no tensor cores; the cache reads dominate).
+        ``WRITE``: the new token's key/value also into the row's own cache slot ``offset`` (no row reads it in
+        this call: a window's rows share their offset and only read slots below it)."""
+        bh = tl.program_id(0)
+        b = bh // H
+        h = bh % H
+        HD: tl.constexpr = H * D
+        off = tl.minimum(tl.maximum(tl.load(offs + b), 0), C).to(tl.int32)
+        d = tl.arange(0, D)
+        base = b.to(tl.int64) * (3 * HD) + h * D
+        q = tl.load(qkv + base + d).to(tl.float32)
+        k_new = tl.load(qkv + base + HD + d)
+        v_new = tl.load(qkv + base + 2 * HD + d)
+        if WRITE:
+            own = ((b.to(tl.int64) * H + h) * C + off) * D + d
+            tl.store(kc + own, k_new, mask=off < C)
+            tl.store(vc + own, v_new, mask=off < C)
+        # the new token first: every row attends to it
+        m_i = tl.sum(q * k_new.to(tl.float32), 0) * QK_SCALE
+        l_i = m_i * 0.0 + 1.0
+        acc = v_new.to(tl.float32)
+        for j0 in range(0, off, BN):
+            j = j0 + tl.arange(0, BN)
+            ok = j < off
+            row = tl.load(src + b.to(tl.int64) * C + j, mask=ok, other=0)
+            row = tl.minimum(tl.maximum(row, 0), tl.num_programs(0) // H - 1)
+            ptr = ((row.to(tl.int64) * H + h) * C + j)[:, None] * D + d[None, :]
+            k = tl.load(kc + ptr, mask=ok[:, None], other=0.0).to(tl.float32)
+            s = tl.where(ok, tl.sum(k * q[None, :], 1) * QK_SCALE, float("-inf"))
+            m_new = tl.maximum(m_i, tl.max(s, 0))
+            alpha = tl.exp2(m_i - m_new)
+            p = tl.exp2(s - m_new)
+            v = tl.load(vc + ptr, mask=ok[:, None], other=0.0).to(tl.float32)
+            acc = acc * alpha + tl.sum(p[:, None] * v, 0)
+            l_i = l_i * alpha + tl.sum(p, 0)
+            m_i = m_new
+        tl.store(y + b.to(tl.int64) * HD + h * D + d, (acc / l_i).to(y.dtype.element_ty))
+
+    @triton.jit
     def _cross_attn_kernel(q_in, kx, vx, S, T, y,
                            H: tl.constexpr, D: tl.constexpr, BS: tl.constexpr, BN: tl.constexpr,
                            QK_SCALE: tl.constexpr):  # fmt: skip
@@ -436,6 +479,28 @@ def self_attn_triton(
     return y
 
 
+def self_attn_step_config(rows: int) -> tuple[int, int]:
+    """(keys per block, warps) of :func:`self_attn_step_triton` for ``rows`` rows (H200, 20 heads: many small
+    programs for many rows, fewer wider ones for few)."""
+    return (16, 1) if rows >= 120 else (32, 2) if rows >= 60 else (64, 4)
+
+
+def self_attn_step_triton(qkv: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, offset: torch.Tensor,
+                          src: torch.Tensor, config: tuple[int, int] | None = None,
+                          write_cache: bool = False) -> torch.Tensor:
+    """:func:`self_attn` of one new token per row (qkv [B, 1, 3HD]) by ``_self_attn_step_kernel``
+    (``write_cache``: the new keys/values also into the caches at ``offset``)."""
+    b, s, _ = qkv.shape
+    if s != 1:
+        raise ValueError("one new token per row")
+    h, c, d = k_cache.shape[1:]
+    bn, warps = config or self_attn_step_config(b)
+    y = qkv.new_empty(b, 1, h * d)
+    _self_attn_step_kernel[(b * h,)](qkv, k_cache, v_cache, offset, src, c, y, H=h, D=d, BN=bn,
+                                     QK_SCALE=_qk_scale(d), WRITE=write_cache, num_warps=warps, num_stages=1)
+    return y
+
+
 def cross_attn_triton(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -481,12 +546,13 @@ def cross_attn_combine_triton(
     return y
 
 
-def logits32_triton(x: torch.Tensor, w: torch.Tensor, config: tuple = LINEAR_TACTICS[0]) -> torch.Tensor:
-    """The :func:`logits32` kernel launched directly."""
+def logits32_triton(x: torch.Tensor, w: torch.Tensor, config: tuple = LINEAR_TACTICS[0],
+                    out: torch.Tensor | None = None) -> torch.Tensor:
+    """The :func:`logits32` kernel launched directly (into ``out`` [B, S, V] fp32 if given)."""
     b, s, k = x.shape
     n = w.shape[0]
     bm, bn, bk, warps, stages = config
-    y = torch.empty(b, s, n, dtype=torch.float32, device=x.device)
+    y = torch.empty(b, s, n, dtype=torch.float32, device=x.device) if out is None else out
     m = b * s
     _linear32_kernel[(triton.cdiv(m, bm), triton.cdiv(n, bn))](
         x.contiguous(), w, m, y, N=n, K=k, BM=bm, BN=bn, BK=bk, num_warps=warps, num_stages=stages

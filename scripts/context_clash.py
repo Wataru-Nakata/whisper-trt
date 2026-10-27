@@ -21,7 +21,7 @@ def main() -> None:
     ap.add_argument("--model", default="openai/whisper-large-v3")
     args = ap.parse_args()
     data = np.load(args.waves)
-    trt = Whisper.from_pretrained(args.model, backend="tensorrt")
+    trt = Whisper.from_pretrained(args.model, backend="tensorrt", decoder="tensorrt")
     cfg = trt.cfg
     L, H, dk, V = cfg.dec_layers, cfg.dec_heads, cfg.head_dim, cfg.vocab_size
     be = trt.backend

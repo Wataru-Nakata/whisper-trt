@@ -27,7 +27,7 @@ def main() -> None:
     torch.backends.cuda.matmul.allow_tf32 = False
     data = np.load(args.waves)
     ref = json.load(open(args.ref))["runs"][args.run]["rows"]
-    trt = Whisper.from_pretrained(args.model, backend="tensorrt")
+    trt = Whisper.from_pretrained(args.model, backend="tensorrt", decoder="tensorrt")
     m32 = load_model(hub.resolve(args.model), trt.cfg, dtype=torch.float32)
     with torch.cuda.stream(trt.stream):  # (the model works on its own stream)
         for i in args.items:

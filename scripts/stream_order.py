@@ -10,7 +10,7 @@ from whisper_trt import Whisper
 
 
 def main() -> None:
-    trt = Whisper.from_pretrained("openai/whisper-large-v3", backend="tensorrt")
+    trt = Whisper.from_pretrained("openai/whisper-large-v3", backend="tensorrt", decoder="tensorrt")
     be, cfg = trt.backend, trt.cfg
     L, H, dk, V = cfg.dec_layers, cfg.dec_heads, cfg.head_dim, cfg.vocab_size
     with torch.cuda.stream(trt.stream):

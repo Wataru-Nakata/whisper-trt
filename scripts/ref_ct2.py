@@ -33,6 +33,7 @@ args = ap.parse_args()
 data = np.load(args.waves)
 meta = json.loads(str(data["meta"]))
 waves = [data[f"w{i}"] for i in range(len(meta))]
+waves = [w.astype(np.float32) / 32768 if w.dtype == np.int16 else w for w in waves]  # (int16 files)
 audio_s = sum(len(w) for w in waves) / 16000
 out = {"meta": meta, "audio_seconds": audio_s, "runs": {}}
 for ct in args.compute_types:

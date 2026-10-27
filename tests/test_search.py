@@ -48,14 +48,14 @@ def fake_step(seed: int):
 
 
 def fake_prefill(seed: int):
-    def prefill(rows, cache, src):
-        n, p = rows.shape
-        out = torch.zeros(n, p, V)
-        for i in range(n):
-            toks = rows[i].tolist()
+    def prefill(slots, tokens, cache, src):
+        k, p = tokens.shape
+        out = torch.zeros(k, p, V)
+        for i in range(k):
+            toks = tokens[i].tolist()
             for j in range(p):
                 out[i, j] = scores_of(toks[: j + 1], seed).float()
-            cache[0, :, i, 0, :p, :] = rows[i].float()[None, :, None]
+            cache[0, :, i, 0, :p, :] = tokens[i].float()[None, :, None]
         return out
 
     return prefill
@@ -147,3 +147,31 @@ def test_search_reaches_limit():
     assert res.reached_max_length and len(res.tokens) == search.max_new
     toks, _ = ct2_beam(prompts[0].tolist(), 2, search.max_new, 0, [EOT], [])
     assert res.tokens == toks
+
+
+@pytest.mark.parametrize("mode,K", [("beam", 3), ("greedy", 1)])
+@pytest.mark.parametrize("check_every", [1, 4])
+def test_refilled_slots_match_independent_decodes(mode, K, check_every):
+    """More windows than slots: each slot takes the next window when its own is done; every window's result is
+    the one it gets decoded alone, whatever ran in the other slots meanwhile."""
+    cfg = make_cfg()
+    seed, P, M = 1, 4, 9
+    suppress, begin = [5, 6, 7], [8, EOT]
+    prompts = [[SOT, 10 + w, 20 + w % 3, 30] for w in range(M)]
+    search = Search(cfg, fake_step(seed), 3, K, P, mode, dtype=torch.float32, device="cpu", max_length=40,
+                    graphs=False)
+    loaded = []
+    results = search.stream(prompts, lambda slots, windows: loaded.append((slots, windows)), fake_prefill(seed),
+                            suppress, begin, check_every=check_every)
+    assert sorted(w for _, ws in loaded for w in ws) == list(range(M))
+    assert len(loaded) > 1  # (refilled at least once)
+    for w, prompt in enumerate(prompts):
+        if mode == "beam":
+            toks, score = ct2_beam(prompt, K, search.max_new, seed, suppress, begin)
+            assert results[w].tokens == toks, w
+            assert results[w].hypothesis.normalized == pytest.approx(score / len(toks), abs=1e-4)
+        else:
+            toks, score = ct2_greedy(prompt, search.max_new, seed, suppress, begin)
+            assert results[w].tokens == toks, w
+        p0 = scores_of(prompt[:1], seed).float().softmax(-1)[NOSPEECH].item()
+        assert results[w].no_speech_prob == pytest.approx(p0, abs=1e-6)

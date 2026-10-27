@@ -10,4 +10,5 @@ dependencies = [
     "nvidia-cublas-cu12==12.9.2.10",
     "nvidia-cudnn-cu12==9.26.0.51",
     "numpy",
+    "av==18.1.0",  # (faster-whisper 1.2.1's decode_audio fails with av 19)
 ]

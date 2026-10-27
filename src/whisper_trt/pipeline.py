@@ -72,6 +72,7 @@ class Whisper:
         self._cross_flat = torch.empty(L * 2 * max_batch * H * T * dk, dtype=backend.dtype, device=self.device)
         self._searches: dict[tuple, Search] = {}
         self._prefills: dict[tuple, tuple] = {}
+        self._stage_flat: torch.Tensor | None = None
 
     @classmethod
     def from_pretrained(
@@ -125,28 +126,42 @@ class Whisper:
         if key not in self._searches:
             step = partial(self.backend.step_fn, cross=self.cross(windows))
             self._searches[key] = Search(self.cfg, step, windows, rows, prompt_length, mode,
-                                         dtype=self.backend.dtype, device=self.device,
-                                         buckets=self.backend.buckets)
+                                         dtype=self.backend.dtype, device=self.device)
         return self._searches[key]
 
-    def _prefill(self, windows: int, rows: torch.Tensor, cache: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
-        """Run the decoder over the prompt rows [N, P] into ``cache`` slots 0..P-1; logits [N, P, V]."""
-        n, p = rows.shape
-        key = (windows, n, p, cache.shape[4], cache.data_ptr(), src.data_ptr())
+    def _decoder(self, key: tuple, tokens: torch.Tensor, cache: torch.Tensor, src: torch.Tensor,
+                 cross: torch.Tensor) -> torch.Tensor:
+        """One decoder call of ``tokens`` [n, p] at positions 0..p-1 against ``cache`` (written there) and
+        ``cross``; logits [n, p, V]. The call's buffers and context are kept under ``key``."""
+        n, p = tokens.shape
         if key not in self._prefills:
             c = self.cfg
-            tokens = torch.zeros(n, p, dtype=torch.long, device=self.device)
+            buf = torch.zeros(n, p, dtype=torch.long, device=self.device)
             offset = torch.zeros(n, dtype=torch.long, device=self.device)
             logits = torch.zeros(n, p, c.vocab_size, dtype=torch.float32, device=self.device)
             new_kv = torch.zeros(c.dec_layers, 2, n, c.dec_heads, p, c.head_dim, dtype=self.backend.dtype,
                                  device=self.device)
-            fn = self.backend.step_fn(tokens, offset, cache, logits, new_kv, src, cross=self.cross(windows))
-            self._prefills[key] = (fn, tokens, logits, new_kv)  # (fn keeps every bound tensor alive)
-        fn, tokens, logits, new_kv = self._prefills[key]
-        tokens.copy_(rows)
+            fn = self.backend.step_fn(buf, offset, cache, logits, new_kv, src, cross=cross)
+            self._prefills[key] = (fn, buf, logits, new_kv)  # (fn keeps every bound tensor alive)
+        fn, buf, logits, new_kv = self._prefills[key]
+        buf.copy_(tokens)
         fn()
         cache[..., :p, :] = new_kv
         return logits
+
+    def _prefill(self, windows: int, slots: slice, tokens: torch.Tensor, cache: torch.Tensor,
+                 src: torch.Tensor) -> torch.Tensor:
+        """A Search's prefill of the rows of consecutive slots (see Search.stream)."""
+        key = ("prefill", windows, slots.start, slots.stop, *tokens.shape, cache.data_ptr())
+        return self._decoder(key, tokens, cache, src, self.cross(windows)[:, :, slots])
+
+    def _staging(self, windows: int) -> torch.Tensor:
+        """A second cross-attention buffer, for windows encoded before they are copied into their slots."""
+        c = self.cfg
+        shape = (c.dec_layers, 2, windows, c.dec_heads, c.enc_frames, c.head_dim)
+        if self._stage_flat is None:
+            self._stage_flat = torch.empty_like(self._cross_flat)
+        return self._stage_flat[: int(np.prod(shape))].view(shape)
 
     def prompt(
         self,
@@ -198,6 +213,45 @@ class Whisper:
                           temperature=temperature if temperature > 0 else 1.0, seed=seed)
 
     @_on_stream
+    def decode(
+        self,
+        audio: list[AudioLike],
+        prompt: list[int],
+        beam_size: int = 5,
+        temperature: float = 0.0,
+        best_of: int = 5,
+        batch_size: int = 8,
+        suppress_tokens: tuple[int, ...] | None = (-1,),
+        suppress_blank: bool = True,
+        seed: int = 0,
+    ) -> list[WindowResult]:
+        """:meth:`generate` for any number of up-to-30 s windows, ``batch_size`` decoding at a time: a slot
+        whose window is done takes the next window (its features computed and encoded then), so no window
+        waits for the slowest of a batch."""
+        if not audio:
+            return []
+        if temperature > 0:
+            mode, rows = "sample", best_of
+        else:
+            mode, rows = ("beam", beam_size) if beam_size > 1 else ("greedy", 1)
+        slots = min(batch_size, len(audio))
+        if slots > self.max_batch:
+            raise ValueError(f"at most {self.max_batch} windows at a time")
+        search = self._search(mode, slots, rows, len(prompt))
+        cross = self.cross(slots)
+
+        def load(slot_ids: list[int], windows: list[int]) -> None:
+            feats = self.features([audio[w] for w in windows])
+            stage = self._staging(len(windows))
+            self.backend.encode(feats, stage)
+            cross[:, :, torch.tensor(slot_ids, device=self.device)] = stage
+
+        suppress = self.tokenizer.suppressed_tokens(suppress_tokens)
+        begin = self.cfg.begin_suppress_tokens if suppress_blank else ()
+        return search.stream([prompt] * len(audio), load, partial(self._prefill, slots), list(suppress),
+                             list(begin), temperature=temperature if temperature > 0 else 1.0, seed=seed)
+
+    @_on_stream
     def detect_language(self, cross: torch.Tensor) -> list[list[tuple[str, float]]]:
         """Language probabilities of encoded windows: the softmax of the language tokens' logits after
         <|startoftranscript|> (CTranslate2's ``detect_language``), best first."""
@@ -205,14 +259,14 @@ class Whisper:
         c = self.cfg
         key = ("lid", windows)
         if key not in self._searches:
-            # a one-token prefill against a cache of the smallest bucket
+            # a one-token call against a small cache
             cache = torch.zeros(c.dec_layers, 2, windows, c.dec_heads, 16, c.head_dim, dtype=self.backend.dtype,
                                 device=self.device)
             src = torch.arange(windows, dtype=torch.int32, device=self.device)[:, None].repeat(1, 16)
             self._searches[key] = (cache, src)
         cache, src = self._searches[key]
         rows = torch.full((windows, 1), c.sot, dtype=torch.long, device=self.device)
-        logits = self._prefill(windows, rows, cache, src)[:, 0]
+        logits = self._decoder(key, rows, cache, src, self.cross(windows))[:, 0]
         probs = logits[:, list(c.lang_ids)].softmax(-1).tolist()
         return [sorted(zip(c.languages, p), key=lambda x: -x[1]) for p in probs]
 
@@ -236,33 +290,30 @@ class Whisper:
     ) -> list[Decoded]:
         """Up-to-30 s windows decoded on their own (no timestamps, no previous text), each as faster-whisper's
         ``generate_with_fallback`` decodes a window, batched: every temperature decodes the windows still
-        unsettled at it together."""
-        feats = self.features(audio)
+        unsettled at it together, ``batch_size`` at a time with refilled slots (:meth:`decode`). ``seed``: the
+        sampling's random numbers (the windows' order and the seed give the same samples)."""
+        waves = [a if isinstance(a, torch.Tensor) and a.dim() == 1 else load_audio(a) for a in audio]
         prompt = self.prompt(language, task, without_timestamps=True)
-        n = feats.shape[0]
+        n = len(waves)
         attempts: list[list[dict]] = [[] for _ in range(n)]
         final: list[Decoded | None] = [None] * n
         pending = list(range(n))
-        for temperature in temperatures:
+        for round_, temperature in enumerate(temperatures):
             if not pending:
                 break
+            results = self.decode([waves[i] for i in pending], prompt, beam_size, temperature, best_of,
+                                  batch_size, suppress_tokens, suppress_blank, seed=seed + round_)
             nxt = []
-            for start in range(0, len(pending), batch_size):
-                idx = pending[start : start + batch_size]
-                cross = self.encode(feats[idx])
-                results = self.generate(cross, prompt, beam_size, temperature, best_of, suppress_tokens,
-                                        suppress_blank, seed=seed + start)
-                for i, r in zip(idx, results):
-                    text = self.tokenizer.decode(r.tokens).strip()
-                    d = {"text": text, "tokens": r.tokens, "avg_logprob": r.hypothesis.avg_logprob,
-                         "no_speech_prob": r.no_speech_prob, "compression_ratio": compression_ratio(text),
-                         "temperature": temperature, "reached_max_length": r.reached_max_length}
-                    attempts[i].append(d)
-                    if not _needs_fallback(d, compression_ratio_threshold, log_prob_threshold,
-                                           no_speech_threshold):
-                        final[i] = _decoded(d, attempts[i][:-1])
-                    else:
-                        nxt.append(i)
+            for i, r in zip(pending, results):
+                text = self.tokenizer.decode(r.tokens).strip()
+                d = {"text": text, "tokens": r.tokens, "avg_logprob": r.hypothesis.avg_logprob,
+                     "no_speech_prob": r.no_speech_prob, "compression_ratio": compression_ratio(text),
+                     "temperature": temperature, "reached_max_length": r.reached_max_length}
+                attempts[i].append(d)
+                if not _needs_fallback(d, compression_ratio_threshold, log_prob_threshold, no_speech_threshold):
+                    final[i] = _decoded(d, attempts[i][:-1])
+                else:
+                    nxt.append(i)
             pending = nxt
         for i in pending:  # every temperature failed: the best below the compression threshold, else any
             ok = [a for a in attempts[i] if compression_ratio_threshold is None

@@ -11,12 +11,18 @@ import argparse
 import json
 import re
 import time
+import zlib
 from pathlib import Path
 
 import numpy as np
 import torch
 
 from whisper_trt import Whisper
+
+
+def load_wave(data, i: int) -> np.ndarray:
+    w = data[f"w{i}"]
+    return w.astype(np.float32) / 32768 if w.dtype == np.int16 else w
 
 
 def words(text: str) -> list[str]:
@@ -54,6 +60,45 @@ def build_options(items: list[str]) -> dict:
     return out
 
 
+def decisions(row: dict, max_new: int = 224) -> dict:
+    """faster-whisper's judgments of a window's decode: avg_logprob, compression ratio and the rules."""
+    n = len(row["tokens"])
+    lp = row["score"] * n / (n + 1) if n else float("-inf")
+    data = row["text"].encode()
+    cr = len(data) / len(zlib.compress(data)) if data else 0.0
+    silence = row["no_speech_prob"] > 0.6 and lp < -1.0
+    return {"avg_logprob": lp, "compression_ratio": cr, "silence": silence,
+            "fallback": not silence and (cr > 2.4 or lp < -1.0), "limit": n >= max_new}
+
+
+def compare(rows: list[dict], run: dict, meta: list[dict], rkey: str, have_text: bool, report: dict) -> str:
+    rr = run["rows"]
+    n = len(rr)
+    same = [a["tokens"] == b["tokens"] for a, b in zip(rows, rr)]
+    both = [(a, b) for a, b, eq in zip(rows, rr, same) if eq]
+    ds = max((abs(a["score"] - b["score"]) for a, b in both), default=0.0)
+    dn = max(abs(a["no_speech_prob"] - b["no_speech_prob"]) for a, b in zip(rows, rr))
+    da = [decisions(a) for a in rows]
+    db = [decisions(b) for b in rr]
+    line = f"    vs {rkey} (RTFx {run['rtfx']:.1f}"
+    if have_text:
+        line += f", {'CER' if UNITS is chars else 'WER'} {wer([r['text'] for r in rr], [m['text'] for m in meta]):.2%}"
+    line += f"): tokens {sum(same)}/{n}, max |score diff| {ds:.2g}, max |no_speech diff| {dn:.2g}"
+    for flag in ("silence", "fallback", "limit"):
+        ours, theirs = sum(d[flag] for d in da), sum(d[flag] for d in db)
+        agree = sum(x[flag] == y[flag] for x, y in zip(da, db))
+        line += f"\n      {flag}: ours {ours}, ref {theirs}, agree {agree}/{n}"
+    diff = [i for i in range(n) if not same[i]]
+    if diff:  # how different the differing windows are: character error rate of ours against the reference
+        err = sum(edit_distance(chars(rows[i]["text"]), chars(rr[i]["text"])) for i in diff)
+        tot = sum(len(chars(rr[i]["text"])) for i in diff)
+        line += f"\n      differing windows: {len(diff)}, their character difference {err / max(1, tot):.2%}"
+    report[rkey] = [{"i": i, "id": meta[i].get("id"), "ours": rows[i]["text"], "ref": rr[i]["text"],
+                     "len": [len(rows[i]["tokens"]), len(rr[i]["tokens"])],
+                     "ours_decisions": da[i], "ref_decisions": db[i]} for i in diff]
+    return line
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("waves")
@@ -65,7 +110,10 @@ def main() -> None:
     ap.add_argument("--lang", default="en")
     ap.add_argument("--configs", nargs="+", default=["1x1", "5x1", "5x8"], help="BEAMxBATCH")
     ap.add_argument("--repeat", type=int, default=2)
+    ap.add_argument("--stream", action="store_true",
+                    help="all windows through refilled slots (Whisper.decode) instead of fixed batches")
     ap.add_argument("--out")
+    ap.add_argument("--report", help="every window that differs from the reference, as JSON")
     args = ap.parse_args()
     global UNITS
     UNITS = chars if args.lang in CER_LANGS else words
@@ -74,7 +122,7 @@ def main() -> None:
 
     data = np.load(args.waves)
     meta = json.loads(str(data["meta"]))
-    waves = [torch.from_numpy(data[f"w{i}"]) for i in range(len(meta))]
+    waves = [torch.from_numpy(load_wave(data, i)) for i in range(len(meta))]
     audio_s = sum(len(w) for w in waves) / 16000
     ref = json.load(open(args.ref))
     t0 = time.perf_counter()
@@ -96,44 +144,39 @@ def main() -> None:
             print(f"encoder: max |diff| {d.max():.3g} mean {d.mean():.3g} (ref max |x| {e.abs().max():.3g})")
 
     prompt = model.prompt(args.lang, without_timestamps=True)
-    out = {}
+    out, report = {}, {}
     for cfg in args.configs:
         beam, batch = map(int, cfg.split("x"))
         times = []
         for rep in range(args.repeat + 1):
             torch.cuda.synchronize()
             t0 = time.perf_counter()
-            rows = []
-            for i in range(0, len(waves), batch):
-                feats = model.features(waves[i : i + batch])
-                cross = model.encode(feats)
-                res = model.generate(cross, prompt, beam_size=beam)
-                rows += [{"tokens": r.tokens, "score": r.hypothesis.normalized, "no_speech_prob": r.no_speech_prob,
-                          "text": model.tokenizer.decode(r.tokens).strip()} for r in res]
+            if args.stream:
+                res = model.decode(waves, prompt, beam_size=beam, batch_size=batch)
+            else:
+                res = []
+                for i in range(0, len(waves), batch):
+                    res += model.generate(model.encode(model.features(waves[i : i + batch])), prompt, beam_size=beam)
+            rows = [{"tokens": r.tokens, "score": r.hypothesis.normalized, "no_speech_prob": r.no_speech_prob,
+                     "text": model.tokenizer.decode(r.tokens).strip()} for r in res]
             torch.cuda.synchronize()
             times.append(time.perf_counter() - t0)
         best = min(times[1:]) if len(times) > 1 else times[0]
-        key = f"beam{beam}/b{batch}"
+        key = f"beam{beam}/b{batch}" + ("/stream" if args.stream else "")
         out[key] = {"rows": rows, "seconds": times, "rtfx": audio_s / best}
-        line = f"{key}: RTFx {audio_s / best:.1f}, {'CER' if UNITS is chars else 'WER'} {wer([r['text'] for r in rows], [m['text'] for m in meta]):.2%}"
+        have_text = any(m["text"] for m in meta)
+        line = f"{key}: RTFx {audio_s / best:.1f}"
+        if have_text:
+            line += f", {'CER' if UNITS is chars else 'WER'} {wer([r['text'] for r in rows], [m['text'] for m in meta]):.2%}"
         for rkey, run in ref["runs"].items():
-            if not rkey.endswith(f"beam{beam}/b{batch}") and f"/beam{beam}/" not in rkey:
+            if f"/beam{beam}/" not in rkey:
                 continue
-            rr = run["rows"]
-            same_text = sum(a["text"] == b["text"] for a, b in zip(rows, rr))
-            same_tok = sum(a["tokens"] == b["tokens"] for a, b in zip(rows, rr))
-            both = [(a, b) for a, b in zip(rows, rr) if a["tokens"] == b["tokens"]]
-            ds = max((abs(a["score"] - b["score"]) for a, b in both), default=0.0)
-            dn = max(abs(a["no_speech_prob"] - b["no_speech_prob"]) for a, b in zip(rows, rr))
-            rw = wer([r["text"] for r in rr], [m["text"] for m in meta])
-            line += (f"\n    vs {rkey} (RTFx {run['rtfx']:.1f}, WER {rw:.2%}): text {same_text}/{len(rr)}, "
-                     f"tokens {same_tok}/{len(rr)}, max |score diff| {ds:.2g}, max |no_speech diff| {dn:.2g}")
-            for i, (a, b) in enumerate(zip(rows, rr)):
-                if a["text"] != b["text"] and same_text >= len(rr) - 5:
-                    line += f"\n      [{i}] ours: {a['text']}\n      [{i}] ref:  {b['text']}"
+            line += "\n" + compare(rows, run, meta, rkey, have_text, report)
         print(line, flush=True)
     if args.out:
         json.dump(out, open(args.out, "w"), ensure_ascii=False, indent=1)
+    if args.report:
+        json.dump(report, open(args.report, "w"), ensure_ascii=False, indent=1)
 
 
 if __name__ == "__main__":

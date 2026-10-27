@@ -35,6 +35,7 @@ from dataclasses import dataclass
 
 import torch
 
+from . import beam_kernels
 from .config import WhisperConfig
 
 LOWEST = torch.finfo(torch.float32).min
@@ -108,6 +109,7 @@ class Search:
         device: str | torch.device = "cuda",
         max_length: int = 448,
         graphs: bool | None = None,
+        fused: bool | None = None,
     ):
         if mode not in ("beam", "greedy", "sample"):
             raise ValueError(f"unknown search mode {mode!r}")
@@ -156,6 +158,14 @@ class Search:
             self.h_score = torch.full((B, S), float("-inf"), dtype=torch.float32, device=dev)
             self.h_len = torch.zeros(B, S, dtype=torch.long, device=dev)
             self.h_tokens = torch.zeros(B, S, T, dtype=torch.long, device=dev)
+        # beam search's bookkeeping in Triton kernels (beam_kernels) on CUDA, unless WHISPER_TRT_FUSED_BEAM=0
+        if fused is None:
+            fused = (mode == "beam" and dev.type == "cuda" and beam_kernels.triton is not None
+                     and os.environ.get("WHISPER_TRT_FUSED_BEAM", "1") != "0")
+        self.fused = fused
+        if fused:
+            self.scores = torch.zeros(N, V, dtype=torch.float32, device=dev)
+            self.ns = torch.zeros(B, dtype=torch.float32, device=dev)
         self._step: Callable | None = None
         self._graph: torch.cuda.CUDAGraph | None = None
 
@@ -172,6 +182,12 @@ class Search:
         self._step()
         if not getattr(self._step, "writes_cache", False):  # (a backend may write them into the cache itself)
             self.cache[:, :, self.row_ar, :, self.offset, :] = self.new_kv[:, :, :, :, 0, :].permute(2, 0, 1, 3, 4)
+        if self.fused:  # the same as below, in three kernels
+            beam_kernels.scores(self.logits[:, 0], self.suppress, self.begin, self.t, self.cum, self.scores,
+                                self.ns, self.K, self.cfg.no_speech)
+            top_s, top_i = self.scores.view(self.B, -1).topk(2 * self.K, dim=1)
+            beam_kernels.update(self, top_s, top_i, self.ns)
+            return
         self.src[self.row_ar, self.offset] = self.row_ids[:, 0]
         lg = self.logits[:: self.K, 0]  # [B, V] (a window's rows are the same until its first step)
         ns = (lg[:, self.cfg.no_speech] - lg.logsumexp(-1)).exp()

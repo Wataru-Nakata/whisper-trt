@@ -11,6 +11,7 @@ import zlib
 import pytest
 import torch
 
+from whisper_trt import beam_kernels
 from whisper_trt.config import WhisperConfig
 from whisper_trt.search import Search
 
@@ -161,3 +162,44 @@ def test_refilled_slots_match_independent_decodes(mode, K, check_every, ahead):
             assert results[w].tokens == toks, w
         p0 = scores_of(prompt[:1], seed).float().softmax(-1)[NOSPEECH].item()
         assert results[w].no_speech_prob == pytest.approx(p0, abs=1e-6)
+
+
+cuda = pytest.mark.skipif(not torch.cuda.is_available() or beam_kernels.triton is None, reason="needs CUDA + Triton")
+
+
+@cuda
+@pytest.mark.parametrize("seed", range(4))
+@pytest.mark.parametrize("K", [3, 5])
+@pytest.mark.parametrize("ahead", [0, 1])
+def test_fused_beam_matches_ct2_with_refills(seed, K, ahead):
+    """The beam bookkeeping in Triton kernels (CUDA): CTranslate2's results, refilled slots included, and the
+    same state as the PyTorch bookkeeping step for step."""
+    cfg = make_cfg()
+    P, M = 4, 7
+    suppress, begin = [5, 6, 7], [8, EOT]
+    prompts = [[SOT, 10 + w, 20 + w % 3, 30] for w in range(M)]
+    runs = {}
+    for fused in (True, False):
+        search = Search(cfg, fake_step(seed), 3, K, P, "beam", dtype=torch.float32, device="cuda", max_length=40,
+                        graphs=False, fused=fused)
+        runs[fused] = search.stream(prompts, lambda slots, windows: None, suppress, begin, check_every=1,
+                                    ahead=ahead)
+    for w, prompt in enumerate(prompts):
+        toks, score = ct2_beam(prompt, K, search.max_new, seed, suppress, begin)
+        for fused, results in runs.items():
+            assert results[w].tokens == toks, (fused, w)
+            assert results[w].hypothesis.normalized == pytest.approx(score / len(toks), abs=1e-4)
+        assert runs[True][w].no_speech_prob == pytest.approx(runs[False][w].no_speech_prob, abs=1e-6)
+        assert [h.tokens for h in runs[True][w].hypotheses] == [h.tokens for h in runs[False][w].hypotheses]
+
+
+@cuda
+def test_fused_beam_reaches_limit():
+    cfg = make_cfg()
+    prompts = torch.tensor([[SOT, 10, 20, 30]])
+    search = Search(cfg, fake_step(0), 1, 2, 4, "beam", dtype=torch.float32, device="cuda", max_length=14,
+                    graphs=False, fused=True)
+    res = search.run(prompts, [EOT], [], check_every=1)[0]  # EOS suppressed
+    assert res.reached_max_length and len(res.tokens) == search.max_new
+    toks, _ = ct2_beam(prompts[0].tolist(), 2, search.max_new, 0, [EOT], [])
+    assert res.tokens == toks

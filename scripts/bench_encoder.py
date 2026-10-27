@@ -1,7 +1,7 @@
 """The TensorRT encoder's time per window by batch size (features -> cross-attention keys/values; CUDA events,
 the model's stream), and the log-mel features' time for comparison.
 
-    python scripts/bench_encoder.py [--batches 1 2 4 8 16 32]
+    python scripts/bench_encoder.py [--batches 1 2 4 8 16 32] [--build opt_level=5]
 """
 
 import argparse
@@ -28,8 +28,11 @@ def timed(fn, reps: int = 10) -> float:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--batches", nargs="+", type=int, default=[1, 2, 4, 8, 16, 32])
+    ap.add_argument("--build", nargs="*", default=[], help="engine build options KEY=VALUE (build.BuildOptions)")
     args = ap.parse_args()
-    model = Whisper.from_pretrained(decoder="triton")
+    from profile_decode import build_options
+
+    model = Whisper.from_pretrained(decoder="triton", **build_options(args.build))
     with torch.cuda.stream(model.stream):
         for n in args.batches:
             feats = torch.randn(n, model.cfg.n_mels, N_FRAMES, device="cuda")

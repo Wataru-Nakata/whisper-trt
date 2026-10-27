@@ -66,6 +66,10 @@ class Whisper:
         self.backend = backend
         self.model = model  # the PyTorch model (torch backend, word timestamps)
         self.max_batch = max_batch
+        # windows per encoder call (the TensorRT engine's largest profile)
+        trt = backend if hasattr(backend, "profiles") else getattr(backend, "encoder", None)
+        profiles = getattr(trt, "profiles", None)
+        self.encode_batch = max(p["batch"][2] for p in profiles["encoder"]) if profiles else max_batch
         self.device = torch.device("cuda")
         self.stream = torch.cuda.Stream(priority=-1)  # (decoding first)
         self.side_stream = torch.cuda.Stream(priority=0)  # windows encoded ahead (_Prefetch)
@@ -107,12 +111,11 @@ class Whisper:
 
         opts = BuildOptions(dtype=dtype, max_batch=max_batch, max_rows=max_rows, **build_options)
         engine_dir = ensure_engines(model_dir, cfg, opts, cache_dir, decoder=decoder == "tensorrt")
-        trt_backend = TRTBackend(cfg, engine_dir, decoder=decoder == "tensorrt")
-        if decoder == "tensorrt":
-            return cls(cfg, tokenizer, trt_backend, None, max_batch)
-        model = load_model(model_dir, cfg, device="cpu", dtype=torch.float16)
-        del model.encoder
-        backend_ = TritonDecoderBackend(model.to("cuda"), trt_backend)
+        backend_ = TRTBackend(cfg, engine_dir, decoder=decoder == "tensorrt")
+        if decoder == "triton":
+            model = load_model(model_dir, cfg, device="cpu", dtype=torch.float16)
+            del model.encoder
+            backend_ = TritonDecoderBackend(model.to("cuda"), backend_)
         return cls(cfg, tokenizer, backend_, None, max_batch)
 
     # --- building blocks --------------------------------------------------------------------------------
@@ -141,8 +144,8 @@ class Whisper:
     def encode(self, feats: torch.Tensor) -> torch.Tensor:
         """Every decoder layer's cross-attention keys/values of the windows' features, as a view of the model's
         buffer (valid until a call with more windows grows it)."""
-        if feats.shape[0] > self.max_batch:
-            raise ValueError(f"at most {self.max_batch} windows per call")
+        if feats.shape[0] > self.encode_batch:
+            raise ValueError(f"at most {self.encode_batch} windows per call")
         cross = self.cross(feats.shape[0])
         self.backend.encode(feats.to(self.device, torch.float32).contiguous(), cross)
         return cross
@@ -252,10 +255,11 @@ class Whisper:
             raise ValueError(f"at most {self.max_batch} windows at a time")
         search = self._search(mode, slots, rows, len(prompt))
         cross = self.cross(slots)
-        ahead = _Prefetch(self, audio, ring=min(slots, len(audio) - slots, 8))
+        at_once = slots <= self.encode_batch  # the first windows in one encoder call (else one by one, ahead)
+        ahead = _Prefetch(self, audio, ring=min(slots, len(audio) - slots, 8) if at_once else min(len(audio), 8))
 
         def load(slot_ids: list[int], windows: list[int]) -> None:
-            if slot_ids == list(range(slots)) and windows == list(range(slots)):  # the first windows: at once
+            if at_once and slot_ids == list(range(slots)) and windows == list(range(slots)):
                 self.backend.encode(self.features([audio[w] for w in windows]), cross)
                 ahead.skip_to(slots)
             else:

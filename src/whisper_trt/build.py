@@ -227,10 +227,14 @@ def _build(
     log.warning("built %s in %.0fs", engine_path.name, time.time() - t0)
 
 
+ENCODER_MAX_BATCH = 32  # (TensorRT 11 finds no kernels for 64 windows; one costs the same at any batch)
+
+
 def encoder_profiles(opts: BuildOptions) -> list[dict]:
     out = [{"batch": (1, 1, 1)}]
-    if opts.max_batch > 1:
-        out.append({"batch": (2, max(2, opts.max_batch // 2), opts.max_batch)})
+    n = min(opts.max_batch, ENCODER_MAX_BATCH)
+    if n > 1:
+        out.append({"batch": (2, max(2, n // 2), n)})
     return out
 
 

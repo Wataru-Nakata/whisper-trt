@@ -43,7 +43,8 @@ passes; faster-whisper 1.2.1 (CTranslate2 4.8.2, fp16) decodes batches of 8 wind
 | YODAS v3 Hindi (300 windows, 2.0 h) | 106 | **384** (3.6x) | **557** (5.3x) | **675** (6.4x) |
 
 Peak GPU memory 15 / 18 / 25 GiB at 8 / 16 / 32 slots. The encoder engine takes about 2 minutes to build on
-first use. With the TensorRT decoder engine instead (`decoder="tensorrt"`, same job): 396 / 510 / 567 on
+first use. 64 slots (`from_pretrained(max_batch=64, max_rows=320)`, 38-41 GiB) give another 3-4%: 649 on
+LibriSpeech, 1058 / 1422 on YODAS Japanese / English. With the TensorRT decoder engine instead (`decoder="tensorrt"`, same job): 396 / 510 / 567 on
 LibriSpeech, 517 / 752 / 871 on YODAS Japanese.
 
 Where the time goes (YODAS Japanese, `scripts/profile_stream.py`, `scripts/profile_body.py`): 98% of the wall
@@ -51,7 +52,14 @@ time in decoder steps at 8 slots (3.4 ms each for 40 rows, with the encoder of t
 on another stream; 2.9 ms alone at 80 cached positions, of which 0.33 ms beam search and bookkeeping), 93% at 32
 slots (7.2 ms each; 5.4 ms alone, 0.63 ms bookkeeping). The encoder costs 6.3 ms a window whatever
 the batch (`scripts/bench_encoder.py`), so on short utterances, padded to 30 s windows like faster-whisper's, it
-is about half of the GPU time at 32 slots (LibriSpeech: 2620 windows, 16.5 s of the 31.5 s).
+is about half of the GPU time at 32 slots (LibriSpeech: 2620 windows, 16.5 s of the 31.5 s). The encoder and
+the decoder steps barely overlap (17% of the shorter, `scripts/overlap.py`): the decoder's ~400 small kernels
+wait for SMs the encoder's GEMMs hold, so the two take turns. Measured and not taken: the encoder confined to
+fewer SMs (a CUDA green context, its profile built for them: more overlap, more time in all, 1413-1535 against
+1323 ms for 120 steps and 100 encodes), the encoder in a CUDA graph (7.35 against 7.52 ms an encode), an
+encoder of cuBLAS GEMMs, cuDNN attention and Triton LayerNorm/GELU (~5.7 against 6.3 ms a window by its parts,
+`scripts/bench_encoder_parts.py`), TensorRT's builder optimization level 5 (6.3 against 6.6 ms a window),
+PyTorch's TunableOp on the decoder's GEMMs (within 2%: each small-M GEMM costs ~8.5 us whatever the algorithm).
 
 ## Agreement with faster-whisper
 

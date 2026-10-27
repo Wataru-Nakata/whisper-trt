@@ -20,14 +20,16 @@ no host synchronization. The no-speech probability is the softmax of the logits 
 <|nospeech|>, as CTranslate2 takes it from its prompt's forward pass.
 
 A step is all device work (decoder call, token choice) on fixed buffers, captured in one CUDA graph; every slot
-has its own position, so windows of any lengths share the steps. The host checks the slots every few steps and
-refills those whose window is done with the next window (:meth:`Search.stream`): a batch does not wait for its
-slowest window. Beam search never moves the KV cache: each row has a table ``src`` [N, C] of the row whose cache
-holds each of its slots (attn_plugin.self_attn); a new beam takes its parent's table, and the token it is fed
-next is written to its own row's slot.
+has its own position, so windows of any lengths share the steps. The host checks the slots after every few steps
+and refills those whose window is done with the next window (:meth:`Search.stream`): a batch does not wait for
+its slowest window. The checks read flags copied asynchronously a few steps back, so the GPU always has steps
+queued while the host collects results and loads windows. Beam search never moves the KV cache: each row has a
+table ``src`` [N, C] of the row whose cache holds each of its slots (attn_plugin.self_attn); a new beam takes its
+parent's table, and the token it is fed next is written to its own row's slot.
 """
 
 import os
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -91,7 +93,8 @@ class Search:
     ``step_fn(tokens, offset, cache, logits, new_kv, src)`` returns a closure that runs a decoder call: tokens
     [N, 1], offset [N] (int64), the self-attention cache [L, 2, N, H, C, d_k], logits [N, 1, V] (fp32), new
     keys/values [L, 2, N, H, 1, d_k] written by the call and the slot table src [N, C] (int32) (the slots'
-    cross-attention keys/values are bound by the caller of ``step_fn``)."""
+    cross-attention keys/values are bound by the caller of ``step_fn``). A closure with ``writes_cache = True``
+    writes the new keys/values into the cache at ``offset`` itself instead."""
 
     def __init__(
         self,
@@ -167,7 +170,8 @@ class Search:
             self._step = self.step_fn(self.tokens, self.offset, self.cache, self.logits, self.new_kv, self.src)
         self.offset.copy_(self.pos.repeat_interleave(self.K))
         self._step()
-        self.cache[:, :, self.row_ar, :, self.offset, :] = self.new_kv[:, :, :, :, 0, :].permute(2, 0, 1, 3, 4)
+        if not getattr(self._step, "writes_cache", False):  # (a backend may write them into the cache itself)
+            self.cache[:, :, self.row_ar, :, self.offset, :] = self.new_kv[:, :, :, :, 0, :].permute(2, 0, 1, 3, 4)
         self.src[self.row_ar, self.offset] = self.row_ids[:, 0]
         lg = self.logits[:: self.K, 0]  # [B, V] (a window's rows are the same until its first step)
         ns = (lg[:, self.cfg.no_speech] - lg.logsumexp(-1)).exp()
@@ -304,19 +308,20 @@ class Search:
         self.forced[s_idx] = prompt
         self.sot_pos[s_idx] = to_dev([p.index(self.cfg.sot) for p in prompts])
         self.tokens[r_idx, 0] = prompt[:, 0].repeat_interleave(K)
-        self.pos[s_idx] = 0
-        self.t[s_idx] = -(P - 1)
+        # (index_fill_, not `x[idx] = value`: that copies the value to the GPU and waits for the queued steps)
+        self.pos.index_fill_(0, s_idx, 0)
+        self.t.index_fill_(0, s_idx, -(P - 1))
         self.src[r_idx] = self.row_ids[r_idx]
         first = torch.arange(len(r_idx), device=dev) % K == 0  # only the first beam takes part in the first step
         self.cum[r_idx] = torch.where(first | (self.mode != "beam"), 0.0, float("-inf"))
         if self.mode == "beam":
-            self.h_count[s_idx] = 0
-            self.h_score[s_idx] = float("-inf")
-            self.h_len[s_idx] = 0
-        self.hist[r_idx] = 0
-        self.length[r_idx] = 0
-        self.row_done[r_idx] = False
-        self.done[s_idx] = False
+            self.h_count.index_fill_(0, s_idx, 0)
+            self.h_score.index_fill_(0, s_idx, float("-inf"))
+            self.h_len.index_fill_(0, s_idx, 0)
+        self.hist.index_fill_(0, r_idx, 0)
+        self.length.index_fill_(0, r_idx, 0)
+        self.row_done.index_fill_(0, r_idx, False)
+        self.done.index_fill_(0, s_idx, False)
 
     def stream(
         self,
@@ -326,11 +331,17 @@ class Search:
         begin_suppress: list[int],
         temperature: float = 1.0,
         seed: int = 0,
-        check_every: int = 4,
+        check_every: int = 1,
+        ahead: int = 1,
     ) -> list[WindowResult]:
         """Decode len(prompts) windows (prompts of length P), at most B at a time: a slot whose window is done
         takes the next one. ``load(slots, windows)`` puts the windows' cross-attention keys/values into those
-        slots (on the current stream, before the next step)."""
+        slots (on the current stream, before the next step).
+
+        The slots' done flags are copied to the host after every ``check_every`` steps and read ``ahead``
+        checks later, so ``ahead * check_every`` steps stay queued while the host collects the finished windows
+        (also asynchronously) and loads the next ones; a finished window's slot runs that many more steps
+        (which change nothing in it) before it is refilled."""
         self.prepare()
         self.suppress.zero_()
         if suppress:
@@ -345,6 +356,10 @@ class Search:
         M = len(prompts)
         results: list[WindowResult | None] = [None] * M
         window = [-1] * self.B  # the window in each slot
+        loaded = [-1] * self.B  # the last check before each slot's window was loaded (older flags are stale)
+        flags: deque = deque()  # (event, done flags on the host, check), oldest first
+        finished: deque = deque()  # (windows, their final state on the host) not yet results
+        checks = 0
         nxt = 0
 
         def fill(slots: list[int]) -> None:
@@ -360,49 +375,96 @@ class Search:
             self._start([s for s, _ in pairs], [prompts[w] for _, w in pairs])
             for s, w in pairs:
                 window[s] = w
+                loaded[s] = checks - 1
+
+        def collect(wait: bool) -> None:
+            while finished and (wait or _ready(finished[0][1][0])):
+                windows, state = finished.popleft()
+                for w, r in zip(windows, self._results(state)):
+                    results[w] = r
 
         fill(list(range(self.B)))
         while any(w >= 0 for w in window):
             for _ in range(check_every):
                 self._run_step()
-            done = self.done.tolist()
-            finished = [s for s in range(self.B) if window[s] >= 0 and done[s]]
-            if not finished:
+            done = _to_host(self.done)
+            flags.append((_record(self.device), done, checks))  # (the event after the copy)
+            checks += 1
+            if len(flags) <= ahead:
                 continue
-            for s, r in zip(finished, self._collect(finished)):
-                results[window[s]] = r
-                window[s] = -1
-            fill(finished)
+            ev, done, check = flags.popleft()
+            _wait(ev)
+            done = done.tolist()
+            slots = [s for s in range(self.B) if window[s] >= 0 and done[s] and check > loaded[s]]
+            if slots:
+                finished.append(([window[s] for s in slots], self._final_state(slots)))
+                for s in slots:
+                    window[s] = -1
+                fill(slots)
+            collect(wait=False)
+        collect(wait=True)
         return results
 
     def run(self, prompt: torch.Tensor, suppress: list[int], begin_suppress: list[int], temperature: float = 1.0,
-            seed: int = 0, check_every: int = 4) -> list[WindowResult]:
+            seed: int = 0, check_every: int = 1, ahead: int = 1) -> list[WindowResult]:
         """The B windows whose cross-attention keys/values are already in the slots (``prompt`` [B, P])."""
         return self.stream(prompt.tolist(), lambda slots, windows: None, suppress, begin_suppress, temperature,
-                           seed, check_every)
+                           seed, check_every, ahead)
 
-    def _collect(self, slots: list[int]) -> list[WindowResult]:
-        """The results of the windows in ``slots`` (all done)."""
-        out = []
-        K = self.K
-        idx = torch.tensor(slots, device=self.device)
-        no_speech = self.no_speech[idx].tolist()
+    def _final_state(self, slots: list[int]) -> tuple:
+        """What the results of the windows in ``slots`` (all done) are made of, copied to the host
+        asynchronously (queued before the slots are loaded again): see :meth:`_results`."""
+        dev, K = self.device, self.K
+        idx = torch.tensor(slots, dtype=torch.long, pin_memory=dev.type == "cuda").to(dev, non_blocking=True)
         if self.mode == "beam":
-            count, score = self.h_count[idx].tolist(), self.h_score[idx].tolist()
-            lengths, tokens = self.h_len[idx].tolist(), self.h_tokens[idx].tolist()
-            for j in range(len(slots)):
+            parts = [self.no_speech[idx], self.h_count[idx], self.h_score[idx], self.h_len[idx], self.h_tokens[idx]]
+        else:
+            rows = (idx[:, None] * K + torch.arange(K, device=dev)).view(-1)
+            parts = [self.no_speech[idx], self.hist[rows], self.cum[rows], self.length[rows]]
+        parts = [_to_host(p) for p in parts]
+        return _record(dev), parts
+
+    def _results(self, state: tuple) -> list[WindowResult]:
+        ev, parts = state
+        _wait(ev)
+        K = self.K
+        out = []
+        if self.mode == "beam":
+            no_speech, count, score, lengths, tokens = (p.tolist() for p in parts)
+            for j in range(len(no_speech)):
                 hyps = [Hypothesis(tokens[j][i][: lengths[j][i]], score[j][i], lengths[j][i])
                         for i in range(min(count[j], 2 * K))]
                 best = max(hyps, key=lambda h: h.normalized)
                 out.append(WindowResult(best, no_speech[j], hyps, self.max_new))
             return out
-        rows = torch.cat([torch.arange(s * K, (s + 1) * K) for s in slots]).to(self.device)
-        hist, cum, length = self.hist[rows].tolist(), self.cum[rows].tolist(), self.length[rows].tolist()
-        for j in range(len(slots)):
+        no_speech, hist, cum, length = (p.tolist() for p in parts)
+        for j in range(len(no_speech)):
             hyps = [Hypothesis(hist[r][: length[r]], cum[r], length[r]) for r in range(j * K, (j + 1) * K)]
             best = max(hyps, key=lambda h: h.normalized)
             out.append(WindowResult(best, no_speech[j], hyps, self.max_new))
         return out
+
+
+def _to_host(t: torch.Tensor) -> torch.Tensor:
+    """A copy of ``t`` on the host: asynchronous (pinned memory) from a GPU."""
+    return t.to("cpu", non_blocking=True) if t.is_cuda else t.clone()
+
+
+def _record(device: torch.device) -> "torch.cuda.Event | None":
+    if device.type != "cuda":
+        return None
+    ev = torch.cuda.Event()
+    ev.record()
+    return ev
+
+
+def _wait(ev) -> None:
+    if ev is not None:
+        ev.synchronize()
+
+
+def _ready(ev) -> bool:
+    return ev is None or ev.query()
 
 
 def _capture(body: Callable[[], None]) -> torch.cuda.CUDAGraph:

@@ -136,8 +136,8 @@ def test_search_reaches_limit():
 
 
 @pytest.mark.parametrize("mode,K", [("beam", 3), ("greedy", 1)])
-@pytest.mark.parametrize("check_every", [1, 4])
-def test_refilled_slots_match_independent_decodes(mode, K, check_every):
+@pytest.mark.parametrize("check_every,ahead", [(1, 0), (4, 0), (1, 2), (3, 1)])
+def test_refilled_slots_match_independent_decodes(mode, K, check_every, ahead):
     """More windows than slots: each slot takes the next window when its own is done; every window's result is
     the one it gets decoded alone, whatever ran in the other slots meanwhile."""
     cfg = make_cfg()
@@ -148,7 +148,7 @@ def test_refilled_slots_match_independent_decodes(mode, K, check_every):
                     graphs=False)
     loaded = []
     results = search.stream(prompts, lambda slots, windows: loaded.append((slots, windows)), suppress, begin,
-                            check_every=check_every)
+                            check_every=check_every, ahead=ahead)
     assert sorted(w for _, ws in loaded for w in ws) == list(range(M))
     assert len(loaded) > 1  # (refilled at least once)
     for w, prompt in enumerate(prompts):

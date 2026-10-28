@@ -9,7 +9,7 @@ for spec in ls-test-clean:en jvs-test:ja fleurs-de:de fleurs-zh:zh fleurs-es:es 
             yodas-ru:ru yodas-es:es yodas-fr:fr yodas-pt:pt yodas-vi:vi yodas-th:th yodas-it:it yodas-id:id yodas-tr:tr; do
   name=${spec%%:*}; lang=${spec#*:}
   types=float16; case $name in yodas-ja|yodas-en|yodas-de|yodas-hi|yodas-ta|yodas-el) types="float32 float16";; esac
-  [ -f $E/tsref-$name.json ] || $REF_PY scripts/ref_ct2.py $E/$name.npz $E/tsref-$name.json --lang $lang --timestamps \
+  [ -f $E/tsref-$name.json ] || $REF_PY scripts/ref_ct2.py $E/$name.npz $E/tsref-$name.json --lang $lang --timestamps --model $REPO/.cache/fw-large-v3 \
     --compute-types $types --configs 5x8 --save-features 0 --repeat 0 2>&1 | tail -2
   echo "=== $name"
   $PY scripts/parity.py $E/$name.npz $E/tsref-$name.json --lang $lang --configs 5x8 5x32 --repeat 0 --stream --timestamps \

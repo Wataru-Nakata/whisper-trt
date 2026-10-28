@@ -173,9 +173,12 @@ cuda = pytest.mark.skipif(not torch.cuda.is_available() or beam_kernels.triton i
 @cuda
 @pytest.mark.parametrize("seed", range(4))
 @pytest.mark.parametrize("K", [3, 5])
-def test_fused_timestamps_match_ct2(seed, K):
+@pytest.mark.parametrize("block", [4096, 32])
+def test_fused_timestamps_match_ct2(seed, K, block, monkeypatch):
     """The fused beam bookkeeping (beam_kernels) with the timestamp rules: CTranslate2's results, as the PyTorch
-    rules give them."""
+    rules give them; also with the vocabulary in several blocks (blocks of text only before the timestamps, as
+    Whisper's 51866 tokens in blocks of 4096)."""
+    monkeypatch.setattr(beam_kernels, "BLOCK_V", block)
     cfg = make_cfg()
     P, M, max_initial = 3, 7, 9
     suppress, begin = [5, 6, 7], [8, EOT]

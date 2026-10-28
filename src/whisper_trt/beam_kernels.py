@@ -23,6 +23,7 @@ except ImportError:  # (no Triton: Search keeps its PyTorch bookkeeping)
     triton = None
 
 LOWEST = torch.finfo(torch.float32).min
+BLOCK_V = 4096  # vocabulary entries per block of scores' passes (tests set fewer: several blocks on small vocabularies)
 
 
 if triton is not None:
@@ -93,7 +94,8 @@ if triton is not None:
             if TS:  # the timestamps' sum and the text tokens' max, for the probability check
                 xt = tl.where(v >= TSB, xm, float("-inf"))
                 n_ts = tl.maximum(m_ts, tl.max(xt, 0))
-                s_ts = s_ts * tl.exp(m_ts - n_ts) + tl.sum(tl.exp(xt - n_ts), 0)
+                none = n_ts == float("-inf")  # (no timestamp yet: blocks of text only, exp(-inf - -inf) is NaN)
+                s_ts = tl.where(none, 0.0, s_ts * tl.exp(m_ts - n_ts) + tl.sum(tl.exp(xt - n_ts), 0))
                 m_ts = n_ts
                 mx_text = tl.maximum(mx_text, tl.max(tl.where(v < TSB, xm, float("-inf")), 0))
         log_sum = tl.log(s_msk)
@@ -201,7 +203,7 @@ def scores(s, logits: torch.Tensor, out: torch.Tensor, ns: torch.Tensor) -> None
     T = s.hist.shape[1]
     _scores_kernel[(n,)](logits, s.suppress, s.begin, s.t, s.cum, out, ns, s.hist, s.max_initial, v, c.no_speech,
                          c.no_timestamps, c.timestamp_begin or 0, c.eot, K=s.K, T=T, TS=s.timestamps, LOW=LOWEST,
-                         BV=4096, TB=triton.next_power_of_2(T), num_warps=8)
+                         BV=BLOCK_V, TB=triton.next_power_of_2(T), num_warps=8)
 
 
 def update(s, top_s: torch.Tensor, top_i: torch.Tensor, ns: torch.Tensor) -> None:

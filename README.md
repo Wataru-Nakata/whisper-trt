@@ -262,7 +262,8 @@ fp32 / fp16.
   (`<|startofprev|>` and at most 223 tokens of the text since the last reset) and its temperature fallback
   (refilled slots, as above); then faster-whisper's rules: a silent window skipped, the tokens split into
   segments, the seek moved to the last timestamp (with word timestamps, the last word's end), the prompt reset
-  after a decode above temperature 0.5, `hallucination_silence_threshold`. Prompts of any length run in the
+  after a decode above temperature 0.5, `hallucination_silence_threshold` (implemented, not compared: the
+  comparisons above use faster-whisper's defaults, as for `initial_prompt`). Prompts of any length run in the
   search's prefilled mode: a window's prompt but its last token goes through one decoder call (outside the
   captured graph) into its slot's cache, and the step graph goes on from the slot's own position, with
   CTranslate2's limit for that prompt, `min(224, 448 - prompt + 1)` new tokens (`tests/test_search.py`: prompts

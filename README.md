@@ -59,7 +59,37 @@ fewer SMs (a CUDA green context, its profile built for them: more overlap, more 
 1323 ms for 120 steps and 100 encodes), the encoder in a CUDA graph (7.35 against 7.52 ms an encode), an
 encoder of cuBLAS GEMMs, cuDNN attention and Triton LayerNorm/GELU (~5.7 against 6.3 ms a window by its parts,
 `scripts/bench_encoder_parts.py`), TensorRT's builder optimization level 5 (6.3 against 6.6 ms a window),
-PyTorch's TunableOp on the decoder's GEMMs (within 2%: each small-M GEMM costs ~8.5 us whatever the algorithm).
+PyTorch's TunableOp on the decoder's GEMMs (within 2%: each small-M GEMM costs ~8.5 us whatever the algorithm);
+for those GEMMs, Triton kernels with programmatic dependent launch or with split-K in one kernel (a tile's last
+K slice adds them up: 1.63 against cuBLAS's 1.19 ms for a step's 192 GEMMs at 40 rows, `scripts/bench_splitk.py`)
+and the next GEMM's weights read into L2 from a side stream (2.59 ms); a two-stage top-k in the beam
+bookkeeping.
+
+### FP8 encoder (opt-in)
+
+`Whisper.from_pretrained(..., fp8=True)` (`whisper-trt transcribe --fp8`; Hopper or newer) runs the encoder MLPs'
+GEMMs in FP8 E4M3 (`whisper_trt/fp8.py`: per-tensor input scales from the scale file the package ships,
+`whisper_trt/fp8_scales/whisper-large-v3.json`, calibrated by `scripts/fp8_calibrate.py` on 742 YODAS windows in
+13 languages from recordings outside the evaluation sets; per-channel weight scales). The encoder takes 5.6
+instead of 6.6 ms a window. End to end, at 8 / 16 / 32 slots, same job:
+
+| set | fp16 | **FP8 MLPs** |
+|---|---|---|
+| LibriSpeech test-clean | 461 / 569 / 632 | **506 / 626 / 691** (+9-10%) |
+| JVS parallel100 | 403 / 505 / 578 | **415 / 540 / 623** (+3-8%) |
+| YODAS Japanese | 671 / 897 / 1059 | **661 / 922 / 1108** (-1 to +5%) |
+| YODAS English | 947 / 1229 / 1406 | **986 / 1311 / 1508** (+4-7%) |
+| YODAS Hindi | 401 / 583 / 710 | **412 / 590 / 728** (+1-3%) |
+
+The decodes change much more than the error rates: identical to faster-whisper fp16 on 93.0% of the clean sets'
+windows (fp16 encoder: 98.9%) and 66% of the YODAS windows (91%; Tamil 109 / 300), with the error rates about
+the same (LibriSpeech WER 2.77% vs 2.77%, JVS CER 6.15% vs 6.11%, FLEURS within 0.07 but Russian 5.08% vs
+4.86%; YODAS caption CER 34.01% vs faster-whisper's 33.89%, per language within 1.9 points) and the decisions
+(silence, fallback, limit) agreeing on 94.7-100% of the windows per set. More of the encoder in FP8 is faster but
+changes even more (`fp8_layers=`, measured on YODAS ja / en, 300 each, identical to faster-whisper fp16): every
+linear layer, 5.3 ms a window, 189 / 203; all but the cross-attention projections 191 / 212; the MLPs (default)
+5.6 ms, 222 / 239; fc1 alone 6.2 ms, 236 / 258; the fp16 encoder 282 / 288. FP8's 3-bit mantissa is the limit,
+not the scales.
 
 ## Agreement with faster-whisper
 
@@ -120,6 +150,12 @@ without VAD.
   inside the graph, so a load is a few asynchronous writes. The next windows' features and encoder run ahead on
   a lower-priority stream (with TensorRT contexts of their own) and are copied into a slot when it frees up. No
   window waits for the slowest of a batch (+22% on LibriSpeech dev-clean at 8 slots).
+* **Beam search's bookkeeping in two Triton kernels** (`whisper_trt/beam_kernels.py`): per row, the masks,
+  log-softmax, cumulative score and no-speech probability; `torch.topk` over each window's K x V scores; per
+  window, CTranslate2's rules (finished hypotheses, the replacement of ended candidates, the new beams' histories
+  and slot tables, prompt feeding). Instead of ~80 small PyTorch kernels: 0.33 -> 0.16 ms a step at 8 slots,
+  0.63 -> 0.37 ms at 32, the same decodes (the PyTorch rules stay the reference: `WHISPER_TRT_FUSED_BEAM=0`, and
+  the tests check both against CTranslate2's loops).
 * **Beam search never moves the KV cache.** Each row has a table of the row whose cache holds each of its
   slots; a new beam takes its parent's table (a few KB) instead of copying the parent's cache (hundreds of MB
   per step at 8 windows x 5 beams). A window's beams share its cross-attention keys/values: their queries are
@@ -189,7 +225,10 @@ snapshot of the code. `scripts/build_env_tar.sh` builds them (from `uv.lock`):
   and engine measurements behind the choices above (Triton GEMMs and programmatic dependent launch lost to
   cuBLAS on the decoder's small-M GEMMs; the PyTorch encoder is slower than TensorRT's, cuBLAS alone ~10% faster
   on its GEMMs); `scripts/fp8_cross_agree.py`: 8-bit cross-attention keys/values (rejected);
-  `scripts/build_check.py`: engine builds from an empty cache.
+  `scripts/build_check.py`: engine builds from an empty cache; `scripts/fused_check.py`: the beam bookkeeping
+  kernels against the PyTorch rules on real windows.
+* `scripts/fp8_calibrate.py`: the FP8 scale file (from `scripts/make_eval_yodas.py --tar -1`: recordings
+  outside the evaluation sets).
 * `scripts/check_engines.py`, `scripts/encoder_variants.py`, `scripts/op_precision.py`,
   `scripts/teacher_force.py`, `scripts/search_debug.py`: component-level checks of the engines.
 * `pytest tests`: search against CTranslate2's loops (refilled slots included), sampling, the Triton kernels (GPU

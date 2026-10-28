@@ -23,7 +23,7 @@ from pathlib import Path
 import torch
 from torch import nn
 
-from . import attn_plugin
+from . import attn_plugin, fp8
 from .config import N_FRAMES, WhisperConfig
 from .modeling import Attention, Precision, WhisperModel, load_model
 from .runtime import trt_logger
@@ -58,6 +58,8 @@ class BuildOptions:
     logits32: bool = False  # the decoder's vocabulary projection in fp32 (TF32 off)
     # the vocabulary projection as a Triton plugin: fp16 inputs, fp32 accumulation (attn_plugin.logits32)
     logits_plugin: bool = True
+    # FP8 encoder GEMMs (fp8.py): the digest of the scale file they were calibrated with; "": fp16
+    fp8_scales: str = ""
 
 
 class _EncoderGraph(nn.Module):
@@ -120,13 +122,16 @@ def _explicit_attention():
         Attention.explicit = False
 
 
-def export_encoder_onnx(model: WhisperModel, path: Path, opts: BuildOptions) -> Path:
+def export_encoder_onnx(model: WhisperModel, path: Path, opts: BuildOptions,
+                        fp8_amax: dict[str, float] | None = None) -> Path:
+    """``fp8_amax``: the input ranges of the layers to export as FP8 GEMMs (fp8.py)."""
     cfg = model.cfg
     path.parent.mkdir(parents=True, exist_ok=True)
     dev = next(model.parameters()).device
     batch = torch.export.Dim("batch", min=1, max=opts.max_batch)
     feats = torch.randn(2, cfg.n_mels, N_FRAMES, device=dev)
-    with _explicit_attention(), _precision(opts.ln32, opts.gelu32_encoder), _quiet_exporter():
+    with (_explicit_attention(), _precision(opts.ln32, opts.gelu32_encoder), _quiet_exporter(),
+          fp8.quantized(model, fp8_amax or {})):
         torch.onnx.export(
             _EncoderGraph(model).eval(),
             (feats,),
@@ -137,6 +142,7 @@ def export_encoder_onnx(model: WhisperModel, path: Path, opts: BuildOptions) -> 
             dynamo=True,
             verbose=False,
             external_data=True,
+            custom_translation_table=fp8.ONNX_TRANSLATIONS if fp8_amax else None,
         )
     return path
 
@@ -263,9 +269,11 @@ def decoder_profile_shapes(cfg: WhisperConfig, opts: BuildOptions, prof: dict) -
 
 
 def build_engines(model: WhisperModel, engine_dir: Path, opts: BuildOptions, keep_onnx: bool = False,
-                  parts: tuple[str, ...] = ("encoder", "decoder")) -> None:
+                  parts: tuple[str, ...] = ("encoder", "decoder"), fp8_amax: dict[str, float] | None = None) -> None:
     """Export and build ``parts`` into ``engine_dir`` (build.json: the options and every engine's profiles,
-    written last)."""
+    written last). ``fp8_amax``: the encoder's FP8 input ranges (with ``opts.fp8_scales`` their digest)."""
+    if bool(fp8_amax) != bool(opts.fp8_scales):
+        raise ValueError("FP8 input ranges and BuildOptions.fp8_scales go together")
     cfg = model.cfg
     engine_dir.mkdir(parents=True, exist_ok=True)
     onnx_dir = engine_dir / "onnx"
@@ -275,7 +283,7 @@ def build_engines(model: WhisperModel, engine_dir: Path, opts: BuildOptions, kee
     meta = json.loads(meta_path.read_text()) if meta_path.exists() else {
         "options": asdict(opts), "config": asdict(cfg), "profiles": {"encoder": enc, "decoder": dec}}
     if "encoder" in parts:
-        enc_onnx = export_encoder_onnx(model, onnx_dir / "encoder" / "encoder.onnx", opts)
+        enc_onnx = export_encoder_onnx(model, onnx_dir / "encoder" / "encoder.onnx", opts, fp8_amax)
         log.warning("exported the encoder's ONNX in %.0fs", time.time() - t0)
         _build(enc_onnx, engine_dir / "encoder.engine",
                [{"feats": tuple((n, cfg.n_mels, N_FRAMES) for n in p["batch"])} for p in enc], opts)
@@ -296,13 +304,20 @@ def build_engines(model: WhisperModel, engine_dir: Path, opts: BuildOptions, kee
         shutil.rmtree(onnx_dir, ignore_errors=True)
 
 
+LATER_FIELDS = {"fp8_scales": ""}  # options added after EXPORT_VERSION 6, with their defaults
+
+
 def engine_tag(opts: BuildOptions) -> str:
     """Directory name identifying an engine build: engines are GPU- and TensorRT-version-specific."""
     import tensorrt as trt
 
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
     gpu = props.name.replace(" ", "_").replace("/", "_")
-    digest = hashlib.sha1(json.dumps(asdict(opts), sort_keys=True).encode()).hexdigest()[:8]
+    fields = asdict(opts)
+    for name, default in LATER_FIELDS.items():  # (at their defaults, the tags of earlier builds stay)
+        if fields[name] == default:
+            del fields[name]
+    digest = hashlib.sha1(json.dumps(fields, sort_keys=True).encode()).hexdigest()[:8]
     return f"v{EXPORT_VERSION}-{gpu}-sm{props.major}{props.minor}-trt{trt.__version__}-{opts.dtype}-{digest}"
 
 
@@ -324,10 +339,11 @@ def model_name(model_dir: Path) -> str:
 
 def ensure_engines(
     model_dir: Path, cfg: WhisperConfig, opts: BuildOptions, cache_dir: str | Path | None = None,
-    decoder: bool = True,
+    decoder: bool = True, fp8_amax: dict[str, float] | None = None,
 ) -> Path:
     """The engine directory for this checkpoint and options, built if missing (``decoder=False``: the encoder
-    engine only; the decoder engine is added to the directory when a later call needs it)."""
+    engine only; the decoder engine is added to the directory when a later call needs it). ``fp8_amax``: the
+    FP8 input ranges ``opts.fp8_scales`` names."""
     engine_dir = cache_root(cache_dir) / model_name(model_dir) / engine_tag(opts)
     meta = engine_dir / "build.json"
     if meta.exists() and (not decoder or (engine_dir / "decoder.engine").exists()):
@@ -335,21 +351,13 @@ def ensure_engines(
     log.warning("building TensorRT engines into %s (first use; this takes several minutes)", engine_dir)
     model = load_model(model_dir, cfg, dtype=DTYPES[opts.dtype])
     if meta.exists():  # the decoder engine for an encoder-only build
-        build_engines(model, engine_dir, opts, parts=("decoder",))
+        build_engines(model, engine_dir, opts, parts=("decoder",), fp8_amax=fp8_amax)
     else:
         tmp = engine_dir.with_name(engine_dir.name + ".tmp")
         shutil.rmtree(tmp, ignore_errors=True)
-        build_engines(model, tmp, opts, parts=("encoder", "decoder") if decoder else ("encoder",))
+        build_engines(model, tmp, opts, parts=("encoder", "decoder") if decoder else ("encoder",),
+                      fp8_amax=fp8_amax)
         tmp.rename(engine_dir)
     del model
     torch.cuda.empty_cache()
-    return engine_dir
-    log.warning("building TensorRT engines into %s (first use; this takes several minutes)", engine_dir)
-    model = load_model(model_dir, cfg, dtype=DTYPES[opts.dtype])
-    tmp = engine_dir.with_name(engine_dir.name + ".tmp")
-    shutil.rmtree(tmp, ignore_errors=True)
-    build_engines(model, tmp, opts)
-    del model
-    torch.cuda.empty_cache()
-    tmp.rename(engine_dir)
     return engine_dir

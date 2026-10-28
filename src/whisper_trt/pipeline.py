@@ -1,10 +1,13 @@
 """The public API: :class:`Whisper` (``from_pretrained``, ``generate``, ``decode_windows``, ``detect_language``)."""
 
 import functools
+import hashlib
 import logging
+import re
 import zlib
 from dataclasses import dataclass, field
 from functools import partial
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -59,6 +62,11 @@ def _on_stream(fn):
     return wrapper
 
 
+# the layers of the FP8 encoder (fp8.py) by default: the MLPs'; the attention and cross-attention projections in
+# FP8 too change many more decodes for little more speed (README)
+FP8_LAYERS = r"^encoder\.layers\.\d+\.fc[12]$"
+
+
 class Whisper:
     def __init__(self, cfg: WhisperConfig, tokenizer: Tokenizer, backend, model=None, max_batch: int = 16):
         self.cfg = cfg
@@ -87,12 +95,19 @@ class Whisper:
         max_rows: int = 160,
         cache_dir: str | None = None,
         decoder: str | None = None,
+        fp8: bool | str = False,
+        fp8_layers: str = FP8_LAYERS,
         **build_options,
     ) -> "Whisper":
         """``backend="tensorrt"``: the TensorRT encoder, and a decoder step of cuBLAS GEMMs and Triton kernels
         (``decoder="triton"``, runtime.TritonDecoderBackend: float16; only the encoder engine is built) or the
         TensorRT decoder engine (``decoder="tensorrt"``: slower, and its GEMMs accumulate less precisely).
-        ``decoder=None``: "triton" for float16, else "tensorrt"."""
+        ``decoder=None``: "triton" for float16, else "tensorrt".
+
+        ``fp8`` (opt-in, Hopper or newer): the encoder's GEMMs in FP8 (fp8.py), with the input ranges of a scale
+        file: True takes the one the package ships for this checkpoint, a path that file; ``fp8_layers``: a regular
+        expression on the names (modeling's, e.g. ``encoder.layers.3.fc1``) of the layers made FP8 (by default
+        the MLPs': the best trade-off measured). Faster encoding, different decodes (see the README)."""
         model_dir = hub.resolve(name)
         cfg = load_config(model_dir)
         tokenizer = Tokenizer(model_dir, cfg)
@@ -107,10 +122,24 @@ class Whisper:
             raise ValueError(f"decoder must be 'tensorrt' or 'triton', got {decoder!r}")
         if decoder == "triton" and dtype != "float16":
             raise ValueError("the Triton decoder runs float16")
+        from . import fp8 as fp8_mod
         from .build import BuildOptions, ensure_engines
 
+        amax = None
+        if fp8:
+            if isinstance(fp8, (str, Path)):
+                path = Path(fp8)
+            else:
+                path = fp8_mod.packaged_scales(fp8_mod.checkpoint_sha256(next(model_dir.glob("model*.safetensors"))))
+            if path is None:
+                raise ValueError(f"no FP8 scale file ships for {name}: pass fp8=PATH (scripts/fp8_calibrate.py)")
+            amax = {k: v for k, v in fp8_mod.load_scales(path)["amax"].items() if re.search(fp8_layers, k)}
+            if not amax:
+                raise ValueError(f"fp8_layers={fp8_layers!r} matches none of the scale file's layers")
+            build_options["fp8_scales"] = (f"s{fp8_mod.scales_digest(path)}-l"
+                                           f"{hashlib.sha1(fp8_layers.encode()).hexdigest()[:8]}")
         opts = BuildOptions(dtype=dtype, max_batch=max_batch, max_rows=max_rows, **build_options)
-        engine_dir = ensure_engines(model_dir, cfg, opts, cache_dir, decoder=decoder == "tensorrt")
+        engine_dir = ensure_engines(model_dir, cfg, opts, cache_dir, decoder=decoder == "tensorrt", fp8_amax=amax)
         backend_ = TRTBackend(cfg, engine_dir, decoder=decoder == "tensorrt")
         if decoder == "triton":
             model = load_model(model_dir, cfg, device="cpu", dtype=torch.float16)

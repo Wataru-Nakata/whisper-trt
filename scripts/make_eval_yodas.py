@@ -6,7 +6,10 @@ between 0.3 and 30 s, at most --per-recording windows per recording. No VAD, so 
 Saved as int16 waves (``w{i}``) with meta (recording id, offset, language) for scripts/ref_ct2.py and
 scripts/parity.py. Runs in the reference env (PyAV).
 
-    python scripts/make_eval_yodas.py OUT_DIR --langs ja en de --per-lang 300
+    python scripts/make_eval_yodas.py OUT_DIR --langs ja en de --per-lang 300 [--tar -1]
+
+``--tar``: which of the language's audio tars (in name order) to read: the evaluation sets take the first (0);
+-1, the last, gives recordings disjoint from them (FP8 calibration, scripts/fp8_calibrate.py).
 """
 
 import argparse
@@ -48,6 +51,7 @@ def main() -> None:
     ap.add_argument("--per-lang", type=int, default=300)
     ap.add_argument("--per-recording", type=int, default=4)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--tar", type=int, default=0)
     args = ap.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -58,7 +62,11 @@ def main() -> None:
             print(f"{path} exists", flush=True)
             continue
         waves, meta = {}, []
-        tar = sorted((ROOT / lang / "audio").glob("*.tar"))[0]
+        tars = sorted((ROOT / lang / "audio").glob("*.tar"))
+        tar = tars[args.tar]
+        if args.tar != 0 and len(tars) < 2:
+            print(f"{lang}: one tar only, skipped", flush=True)
+            continue
         with tarfile.open(tar) as tf:
             for member in tf:
                 if len(meta) >= args.per_lang:

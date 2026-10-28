@@ -1,8 +1,9 @@
 """One decoder step's GEMMs (32 layers x QKV, out, cross query, cross out, fc1, fc2) as a chain captured in a CUDA
 graph: cuBLAS against Triton GEMM kernels with and without programmatic dependent launch (PDL: the next kernel
-launches while the previous one runs, and waits for its results only before reading them).
+launches while the previous one runs, and waits for its results only before reading them); and cuBLAS with the
+next GEMM's weights read into L2 on a side stream while each GEMM runs (--prefetch-only: that alone).
 
-    python scripts/bench_gemm_chain.py [--rows 40 160]
+    python scripts/bench_gemm_chain.py [--rows 40 160] [--prefetch-only]
 """
 
 import argparse
@@ -61,6 +62,7 @@ def graph_time(body, reps: int = 50) -> float:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--rows", nargs="+", type=int, default=[40, 160])
+    ap.add_argument("--prefetch-only", action="store_true")
     args = ap.parse_args()
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
     weights = [[(torch.randn(n, k, device="cuda").half() * 0.02, torch.randn(n, device="cuda").half())
@@ -77,6 +79,25 @@ def main() -> None:
 
         t = graph_time(cublas)
         print(f"rows {m}: cuBLAS {t:.3f} ms ({nbytes / t / 1e9:.2f} TB/s of weights)", flush=True)
+        flat = [(w, b, n, k) for layer in weights for (w, b), (n, k) in zip(layer, SHAPES)]
+        side = torch.cuda.Stream()
+        sink = torch.zeros((), device="cuda")
+        for ahead in (1, 2):
+            def prefetched():
+                main = torch.cuda.current_stream()
+                for i, (w, b, n, k) in enumerate(flat):
+                    if i + ahead < len(flat):  # the weights of the GEMM `ahead` later, into L2
+                        side.wait_stream(main)
+                        with torch.cuda.stream(side):
+                            sink.add_(flat[i + ahead][0].sum(dtype=torch.float32))
+                    torch.addmm(b, xs[k], w.t(), out=outs[n])
+                main.wait_stream(side)
+
+            t2 = graph_time(prefetched)
+            print(f"rows {m}: cuBLAS, weights {ahead} GEMM(s) ahead read into L2 on a side stream: {t2:.3f} ms "
+                  f"({nbytes / t2 / 1e9:.2f} TB/s)", flush=True)
+        if args.prefetch_only:
+            continue
         for bm, bn, bk, warps, stages in ((64, 16, 128, 4, 4), (64, 32, 128, 4, 4), (64, 64, 64, 4, 3),
                                           (32, 32, 128, 4, 4), (16, 64, 128, 4, 4), (128, 16, 128, 4, 3),
                                           (256, 16, 64, 8, 3)):

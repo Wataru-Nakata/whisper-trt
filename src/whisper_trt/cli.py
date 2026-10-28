@@ -18,6 +18,8 @@ def main(argv: list[str] | None = None) -> None:
         p.add_argument("--decoder", default=None, choices=("triton", "tensorrt"),
                        help="triton: cuBLAS GEMMs + Triton kernels (the default for float16); tensorrt: the TensorRT "
                             "decoder engine")
+        p.add_argument("--fp8", action="store_true",
+                       help="FP8 GEMMs in the encoder's MLPs (Hopper+; faster, different decodes: see the README)")
     for p in (t, d):
         p.add_argument("audio", nargs="+")
         p.add_argument("--batch-size", type=int, default=8)
@@ -29,7 +31,8 @@ def main(argv: list[str] | None = None) -> None:
 
     from . import Whisper
 
-    model = Whisper.from_pretrained(args.model, backend=args.backend, max_batch=args.max_batch, decoder=args.decoder)
+    model = Whisper.from_pretrained(args.model, backend=args.backend, max_batch=args.max_batch, decoder=args.decoder,
+                                    fp8=args.fp8)
     if args.cmd == "build":
         print("engines ready", file=sys.stderr)
     elif args.cmd == "transcribe":

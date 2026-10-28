@@ -16,14 +16,19 @@ model = Whisper.from_pretrained("openai/whisper-large-v3")   # first call builds
 out = model.decode_windows(["a.wav", "b.wav", ...], language="ja", batch_size=16)
 out[0].text, out[0].avg_logprob, out[0].no_speech_prob, out[0].compression_ratio, out[0].temperature
 
-# one pass, CTranslate2-style results (tokens, scores, no-speech probabilities)
+# with timestamps: each window's segments, as faster-whisper splits them
+out = model.decode_windows(["a.wav", ...], language="ja", without_timestamps=False)
+[(seg["start"], seg["end"], seg["text"]) for seg in out[0].segments]
+
+# one pass, CTranslate2-style results (tokens, scores, no-speech probabilities); a prompt without
+# <|notimestamps|> (model.prompt("en", without_timestamps=False)) decodes with timestamps
 res = model.decode(["a.wav", "b.wav", ...], model.prompt("en"), beam_size=5, batch_size=32)
 model.detect_language(model.encode(model.features(["a.wav"])))   # [[("en", 0.99), ...]]
 ```
 
 ```bash
 whisper-trt build                                  # optional: pre-build the encoder engine
-whisper-trt transcribe --language en a.wav b.wav   # --json for every value
+whisper-trt transcribe --language en a.wav b.wav   # --json for every value, --timestamps for segments
 whisper-trt detect-language a.wav
 ```
 
@@ -126,6 +131,17 @@ without VAD.
   (`scripts/yodas_captions.py`). Language identification: top-1 equal to CTranslate2's on 64/64 Japanese and
   English clips. With every window forced through the temperature fallback (`scripts/smoke_workload.py
   --force-fallback`), 64 Japanese clips decode six times each (beam 5, then best-of-5 sampling) at RTFx 57.
+* **With timestamps** (the prompt without `<|notimestamps|>`, against faster-whisper decoding with timestamps
+  too, `scripts/ref_ct2.py --timestamps`): in fp32 the tokens, timestamps included, are faster-whisper fp32's
+  on 300/300 YODAS windows each of ja, en, de, hi, ta and el (1800 windows; scores within 7e-6). In fp16 they are identical to
+  faster-whisper fp16's on 97.7% of the clean sets' windows (95.5% FLEURS fr - 98.2% LibriSpeech; WER/CER
+  within 0.06, e.g. LibriSpeech 3.33% vs 3.27%) and 82.9% of the 5400 YODAS windows (66.0% ta - 90.7% ja),
+  the decisions agreeing on 98-100%. Timestamps add near-ties (a timestamp one 20 ms step later, a segment
+  closed one token earlier), for faster-whisper itself too: its fp16 and fp32 agree on 275 / 282 / 270 / 248 /
+  202 / 260 of 300 YODAS ja / en / de / hi / ta / el windows, whisper-trt fp16 and faster-whisper fp32 on 274 /
+  285 / 267 / 259 / 224 / 266. faster-whisper slows down with timestamps (its rules run on the host every
+  step: 62 RTFx on LibriSpeech, 84 on YODAS ja), whisper-trt hardly (in the step graph: 405 / 600 and 498 /
+  884 at 8 / 32 slots, one pass).
 
 ## How it works
 
@@ -151,6 +167,11 @@ without VAD.
   inside the graph, so a load is a few asynchronous writes. The next windows' features and encoder run ahead on
   a lower-priority stream (with TensorRT contexts of their own) and are copied into a slot when it frees up. No
   window waits for the slowest of a batch (+22% on LibriSpeech dev-clean at 8 slots).
+* **Timestamps.** A prompt without `<|notimestamps|>` decodes with CTranslate2's timestamp rules
+  (`ApplyTimestampRules`) after the suppressed tokens, per row from its own history, inside the step graph:
+  never `<|notimestamps|>`; a timestamp first, at most 1 s (`max_initial_timestamp_index`, 50); timestamps in
+  pairs and never decreasing; text only if some text token is likelier than all timestamps together. Each
+  window's tokens split into segments as faster-whisper splits them (`whisper_trt/segments.py`).
 * **Beam search's bookkeeping in two Triton kernels** (`whisper_trt/beam_kernels.py`): per row, the masks,
   log-softmax, cumulative score and no-speech probability; `torch.topk` over each window's K x V scores; per
   window, CTranslate2's rules (finished hypotheses, the replacement of ended candidates, the new beams' histories

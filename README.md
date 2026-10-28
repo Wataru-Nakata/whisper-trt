@@ -20,6 +20,11 @@ out[0].text, out[0].avg_logprob, out[0].no_speech_prob, out[0].compression_ratio
 out = model.decode_windows(["a.wav", ...], language="ja", without_timestamps=False)
 [(seg["start"], seg["end"], seg["text"]) for seg in out[0].segments]
 
+# recordings of any length, as faster-whisper's WhisperModel.transcribe transcribes each (seek, previous-text
+# prompts, temperature fallback, timestamps; word timestamps optional), many recordings decoding together
+segments = model.transcribe(["long1.wav", "long2.wav", ...], "ja", word_timestamps=True, batch_size=32)
+[(s.start, s.end, s.text, [(w.word, w.start, w.end) for w in s.words]) for s in segments[0]]
+
 # one pass, CTranslate2-style results (tokens, scores, no-speech probabilities); a prompt without
 # <|notimestamps|> (model.prompt("en", without_timestamps=False)) decodes with timestamps
 res = model.decode(["a.wav", "b.wav", ...], model.prompt("en"), beam_size=5, batch_size=32)
@@ -29,6 +34,7 @@ model.detect_language(model.encode(model.features(["a.wav"])))   # [[("en", 0.99
 ```bash
 whisper-trt build                                  # optional: pre-build the encoder engine
 whisper-trt transcribe --language en a.wav b.wav   # --json for every value, --timestamps for segments
+whisper-trt transcribe --long --word-timestamps --language ja long1.wav long2.wav   # recordings of any length
 whisper-trt detect-language a.wav
 ```
 
@@ -143,6 +149,84 @@ without VAD.
   step: 62 RTFx on LibriSpeech, 84 on YODAS ja), whisper-trt hardly (in the step graph: 405 / 600 and 498 /
   884 at 8 / 32 slots, one pass).
 
+## Long-form transcription
+
+`transcribe` against faster-whisper 1.2.1's `WhisperModel.transcribe` with its defaults (beam 5, the temperature
+fallback, conditioned on the previous text, timestamps, no VAD), with and without word timestamps, on 20
+recordings per set: YODAS v3 Japanese and English (the first minutes of recordings, 60-300 s, 1.17 h / 1.45 h,
+`scripts/make_eval_long.py`) and LibriSpeech test-clean chapters (a chapter's utterances joined with 0.3 s
+pauses, 78-239 s, 1.02 h, `scripts/make_long_ls.py`). One H200, RTFx over all the recordings, features
+included. faster-whisper transcribes one recording at a time; so can whisper-trt, or it decodes the next window
+of every recording together, in `batch_size` slots.
+
+| set | faster-whisper fp32 | fp16 | **whisper-trt fp16, one recording at a time** | **20 recordings, 8 slots** | **32 slots** |
+|---|---:|---:|---:|---:|---:|
+| YODAS Japanese | 15.9 | 23.5 | **65.8** (2.8x) | **170** (7.2x) | **190** (8.1x) |
+| with word timestamps | 16.0 | 23.0 | **50.0** (2.2x) | **106** (4.6x) | **146** (6.3x) |
+| YODAS English | 14.7 | 19.4 | **51.2** (2.6x) | **117** (6.0x) | **122** (6.3x) |
+| with word timestamps | 14.5 | 22.2 | **46.3** (2.1x) | **87** (3.9x) | **98** (4.4x) |
+| LibriSpeech chapters | 10.9 | 16.1 | **36.5** (2.3x) | **81** (5.0x) | **98** (6.1x) |
+| with word timestamps | 11.1 | 15.2 | **34.0** (2.2x) | **77** (5.1x) | **97** (6.4x) |
+
+(x: against faster-whisper fp16.) A recording's windows depend on each other (the seek, the previous text):
+alone, its windows decode one after another in one slot; 20 recordings fill at most 20 slots, and each round of
+windows waits for its slowest (a window through the whole fallback decodes six times). Word timestamps cost a
+second encoder pass per window and one decoder call over its text (below).
+
+Agreement with faster-whisper fp32, next to faster-whisper fp16's own (8 slots):
+
+| set | | recordings with the same segments | segments the same before the first sampled window | CER / WER of the transcripts |
+|---|---|---:|---:|---:|
+| YODAS Japanese | faster-whisper fp16 | 3/20 | 352/803 | 3.53% |
+| | **whisper-trt fp16** | **10/20** | **572/824** | **2.17%** |
+| | whisper-trt fp32 | 13/20 | 732/820 | 1.60% |
+| YODAS English | faster-whisper fp16 | 2/20 | 297/525 | 20.43% |
+| | **whisper-trt fp16** | **3/20** | **301/525** | **21.24%** |
+| | whisper-trt fp32 | 5/20 | 499/529 | 16.50% |
+| LibriSpeech chapters | faster-whisper fp16 | 2/20 | 146/183 | 9.97% |
+| | **whisper-trt fp16** | **1/20** | **157/182** | **13.71%** |
+| | whisper-trt fp32 | 3/20 | 184/207 | 12.18% |
+
+The same segments: the same tokens, start and end. A recording agrees at most up to its first window decoded by
+sampling (a window failing the fallback's thresholds at temperature 0, in either decode): sampled tokens are
+random (our random numbers are not CTranslate2's), they become the prompt of the next windows, and the rest of
+the recording differs. "Before the first sampled window" counts the segments the same up to a recording's first
+difference, of those before either decode's first sampled window. The fallback is frequent on these sets
+(faster-whisper fp32 samples 42 of 917 segments of YODAS Japanese, 276 of 1065 English and 73 of 562
+LibriSpeech, in 16 of the 20 chapters), so whole recordings rarely agree and the transcripts' error rates against
+faster-whisper fp32 are mostly those of two samplings. The quality is the same: on the LibriSpeech chapters the
+WER against the reference text is 5.17-9.77% for whisper-trt fp16 over six seeds of the sampling (`seed=0..5`,
+mean 6.9%), 8.46% for whisper-trt fp32, 7.98% for faster-whisper fp32 and 5.82% for fp16.
+
+* **fp32**: 18 / 19 / 19 of the 20 recordings of each set agree with faster-whisper fp32 up to their first
+  sampled window (with word timestamps 18 / 17 / 19); the differences before it are near-ties (a timestamp or a
+  word's start 20 ms apart, a comma for a period, one word for another, a segment closed one word earlier). These windows have prompts of previous text (prefilled, up to 223 tokens),
+  which the window-level comparison above doesn't.
+* **One recording at a time**, the fp16 decodes differ in other places (other GEMM shapes): against
+  faster-whisper fp32, 5/20 / 455/818 / CER 2.43% on YODAS Japanese, 2/20 / 354/525 / 18.14% on English,
+  2/20 / 146/182 / 11.41% on LibriSpeech. In fp32, one at a time and twenty together give the same segments on
+  18 of the 20 Japanese recordings (the other two: a filler word more, a sampled window).
+
+With word timestamps (the seek then follows the last word's end, so a word's timing moves the next window too);
+words compared on the segments the same up to a recording's first difference:
+
+| set | | recordings with the same segments | segments the same before the first sampled window | CER / WER | words with the same start and end |
+|---|---|---:|---:|---:|---:|
+| YODAS Japanese | faster-whisper fp16 | 4/20 | 289/763 | 3.00% | 98.7% of 6034 |
+| | **whisper-trt fp16** | **7/20** | **314/828** | **1.39%** | **98.8% of 6287** |
+| | whisper-trt fp32 | 15/20 | 920/928 | 0.51% | 99.9% of 15172 |
+| YODAS English | faster-whisper fp16 | 1/20 | 201/595 | 15.90% | 98.6% of 2623 |
+| | **whisper-trt fp16** | **1/20** | **194/602** | **16.04%** | **98.5% of 2604** |
+| | whisper-trt fp32 | 4/20 | 547/603 | 13.64% | 99.9% of 5932 |
+| LibriSpeech chapters | faster-whisper fp16 | 2/20 | 111/187 | 10.48% | 98.3% of 3338 |
+| | **whisper-trt fp16** | **1/20** | **116/184** | **12.98%** | **97.8% of 2994** |
+| | whisper-trt fp32 | 4/20 | 202/213 | 10.66% | 99.8% of 4328 |
+
+The other words are within one 20 ms step but a few (whisper-trt fp16: 99.7-99.9% within 0.02 s, at most
+0.12 s off; fp32: all within 0.02 s but two of 0.06 s; faster-whisper fp16: 99.9-100%, at most 0.22 s). WER
+against the LibriSpeech text: 6.75% for whisper-trt fp16, 6.27% for fp32, 6.17% / 6.34% for faster-whisper
+fp32 / fp16.
+
 ## How it works
 
 * **No faster-whisper, no CTranslate2.** Whisper is reimplemented in plain PyTorch (`whisper_trt/modeling.py`);
@@ -172,6 +256,24 @@ without VAD.
   never `<|notimestamps|>`; a timestamp first, at most 1 s (`max_initial_timestamp_index`, 50); timestamps in
   pairs and never decreasing; text only if some text token is likelier than all timestamps together. Each
   window's tokens split into segments as faster-whisper splits them (`whisper_trt/segments.py`).
+* **Long-form** (`whisper_trt/longform.py`). A recording's features are computed once over the whole recording
+  (one normalization, as faster-whisper's), and each window is up to 30 s of them from the recording's seek.
+  Each round decodes the next window of every recording not done, with faster-whisper's prompt
+  (`<|startofprev|>` and at most 223 tokens of the text since the last reset) and its temperature fallback
+  (refilled slots, as above); then faster-whisper's rules: a silent window skipped, the tokens split into
+  segments, the seek moved to the last timestamp (with word timestamps, the last word's end), the prompt reset
+  after a decode above temperature 0.5, `hallucination_silence_threshold`. Prompts of any length run in the
+  search's prefilled mode: a window's prompt but its last token goes through one decoder call (outside the
+  captured graph) into its slot's cache, and the step graph goes on from the slot's own position, with
+  CTranslate2's limit for that prompt, `min(224, 448 - prompt + 1)` new tokens (`tests/test_search.py`: prompts
+  of different lengths in refilled slots, against CTranslate2's loops).
+* **Word timestamps** (`whisper_trt/alignment.py`): CTranslate2's `align`, then faster-whisper's words. A
+  window's encoder output once more (the decode's has been overwritten by then) and one call of the PyTorch
+  decoder on the same weights over `sot_sequence, <|notimestamps|>`, the text tokens and `<|endoftext|>`: the
+  alignment heads' cross-attention softmaxed over the window's frames, normalized over the tokens,
+  median-filtered (width 7) and averaged over the heads; a dynamic time warping along anti-diagonals with
+  CTranslate2's tie-breaking (`tests/test_alignment.py`: against line-by-line transcriptions of `dtw.cc` and
+  `median_filter_cpu.cc`); then faster-whisper's word splitting, punctuation merging and duration clamps.
 * **Beam search's bookkeeping in two Triton kernels** (`whisper_trt/beam_kernels.py`): per row, the masks,
   log-softmax, cumulative score and no-speech probability; `torch.topk` over each window's K x V scores; per
   window, CTranslate2's rules (finished hypotheses, the replacement of ended candidates, the new beams' histories
@@ -215,8 +317,13 @@ without VAD.
 
 ## Limitations
 
-* Every input is one window of at most 30 s: longer audio is trimmed, not chunked (features are normalized
-  over the whole input, as faster-whisper normalizes a clip).
+* `decode` / `decode_windows` take windows of at most 30 s (longer audio is trimmed; features are normalized
+  over the whole input, as faster-whisper normalizes a clip); `transcribe` takes recordings of any length.
+* `transcribe` needs the language (no detection), and has no VAD filter, `clip_timestamps`, `prefix`,
+  `hotwords` or per-segment language detection (`multilingual`). Long prompts (previous text) and word
+  timestamps need the default Triton decoder or the PyTorch backend (the TensorRT decoder engine prefills at
+  most 32 tokens). Its rounds wait for their slowest window (a recording's next window could start as soon as
+  its previous one is done), and word timestamps encode each window a second time.
 * Tested with torch 2.14.1 (CUDA 13) + TensorRT 11.4.0.106 on H200 only.
 
 ## Development
@@ -249,7 +356,13 @@ snapshot of the code. `scripts/build_env_tar.sh` builds them (from `uv.lock`):
   kernels against the PyTorch rules on real windows.
 * `scripts/fp8_calibrate.py`: the FP8 scale file (from `scripts/make_eval_yodas.py --tar -1`: recordings
   outside the evaluation sets).
+* `scripts/make_eval_long.py`, `scripts/make_long_ls.py`: the long-form sets; `scripts/ref_long.py`:
+  faster-whisper's `transcribe` on them (in the reference env); `scripts/longform_parity.py`: ours against it
+  (`--single`: one recording at a time; `--seed`); `scripts/longform_compare.py`: the same scores from saved
+  outputs, and the WER against a set's reference text; `scripts/longform_smoke.py`: a few recordings' segments
+  and words.
 * `scripts/check_engines.py`, `scripts/encoder_variants.py`, `scripts/op_precision.py`,
   `scripts/teacher_force.py`, `scripts/search_debug.py`: component-level checks of the engines.
-* `pytest tests`: search against CTranslate2's loops (refilled slots included), sampling, the Triton kernels (GPU
-  tests skip on CPU).
+* `pytest tests`: search against CTranslate2's loops (refilled slots and prompts of any length included),
+  timestamp rules, sampling, word alignment's time warping and median filter, the Triton kernels (GPU tests skip
+  on CPU).

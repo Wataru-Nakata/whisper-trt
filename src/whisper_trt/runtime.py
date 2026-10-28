@@ -333,6 +333,11 @@ class TRTBackend:
         run.keep = (ctx, tokens, offset, cache, logits, new_kv, src, cross)
         return run
 
+    @property
+    def max_prefill(self) -> int:
+        """The longest prompt the decoder engine takes in one call."""
+        return max(p["seq"][2] for p in self.profiles["decoder"])
+
     def _decoder_profile(self, rows: int, seq: int) -> int:
         for i, p in enumerate(self.profiles["decoder"]):
             if p["batch"][0] <= rows <= p["batch"][2] and p["seq"][0] <= seq <= p["seq"][2]:

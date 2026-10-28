@@ -338,9 +338,15 @@ class Whisper:
         src = torch.zeros(1, 16, dtype=torch.int32, device=dev)
         offset = torch.zeros(1, dtype=torch.long, device=dev)
 
+        limit = getattr(self.backend, "max_prefill", None) if getattr(self.backend, "decoder", None) else None
+
         def prefill(slots: list[int], prompts: list[list[int]]) -> None:
             for s, p in zip(slots, prompts):
                 n = len(p) - 1
+                if limit is not None and n > limit:
+                    raise NotImplementedError(f"a prompt of {n + 1} tokens: the TensorRT decoder engine prefills at "
+                                              f"most {limit}; prompts with previous text need the Triton decoder "
+                                              "(the default) or the PyTorch backend")
                 tokens = torch.tensor([p[:-1]], dtype=torch.long, pin_memory=True).to(dev, non_blocking=True)
                 logits = torch.empty(1, n, c.vocab_size, dtype=torch.float32, device=dev)
                 new_kv = torch.empty(c.dec_layers, 2, 1, c.dec_heads, n, c.head_dim, dtype=self.backend.dtype,

@@ -1,6 +1,7 @@
 """whisper-trt build | transcribe | detect-language"""
 
 import argparse
+import dataclasses
 import json
 import sys
 
@@ -9,7 +10,7 @@ def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(prog="whisper-trt")
     sub = ap.add_subparsers(dest="cmd", required=True)
     b = sub.add_parser("build", help="build (or find) the TensorRT engines")
-    t = sub.add_parser("transcribe", help="transcribe up-to-30 s recordings, each on its own")
+    t = sub.add_parser("transcribe", help="transcribe up-to-30 s recordings, each on its own (--long: of any length)")
     d = sub.add_parser("detect-language", help="language probabilities of each recording's first 30 s")
     for p in (b, t, d):
         p.add_argument("--model", default="openai/whisper-large-v3")
@@ -28,7 +29,12 @@ def main(argv: list[str] | None = None) -> None:
     t.add_argument("--beam-size", type=int, default=5)
     t.add_argument("--json", action="store_true", help="every value per recording, as JSON lines")
     t.add_argument("--timestamps", action="store_true", help="decode with timestamps: segments per recording")
+    t.add_argument("--long", action="store_true",
+                   help="recordings of any length, as faster-whisper's WhisperModel.transcribe (segments)")
+    t.add_argument("--word-timestamps", action="store_true", help="with --long: each segment's words")
     args = ap.parse_args(argv)
+    if args.cmd == "transcribe" and args.word_timestamps and not args.long:
+        ap.error("--word-timestamps needs --long")
 
     from . import Whisper
 
@@ -36,6 +42,18 @@ def main(argv: list[str] | None = None) -> None:
                                     fp8=args.fp8)
     if args.cmd == "build":
         print("engines ready", file=sys.stderr)
+    elif args.cmd == "transcribe" and args.long:
+        out = model.transcribe(args.audio, args.language, args.task, beam_size=args.beam_size,
+                               batch_size=args.batch_size, word_timestamps=args.word_timestamps)
+        for path, segments in zip(args.audio, out):
+            if args.json:
+                print(json.dumps({"audio": path, "segments": [dataclasses.asdict(s) for s in segments]},
+                                 ensure_ascii=False))
+                continue
+            for s in segments:
+                print(f"{path}\t[{s.start:.2f} -> {s.end:.2f}]\t{s.text.strip()}")
+                for w in s.words or []:
+                    print(f"{path}\t  [{w.start:.2f} -> {w.end:.2f}]\t{w.word.strip()}")
     elif args.cmd == "transcribe":
         out = model.decode_windows(args.audio, args.language, args.task, beam_size=args.beam_size,
                                    batch_size=args.batch_size, without_timestamps=not args.timestamps)

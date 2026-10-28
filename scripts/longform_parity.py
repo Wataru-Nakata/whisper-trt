@@ -4,7 +4,9 @@ recording's first difference, the error rate of our whole transcripts against fa
 of the same segments, and the time taken.
 
     python scripts/longform_parity.py WAVES.npz REF.json --lang ja [--word-timestamps] [--batch 8 32]
-        [--backend torch --dtype float32] [--out OURS.json]
+        [--backend torch --dtype float32] [--seed 0] [--single] [--out OURS.json]
+
+--single: one recording at a time (as faster-whisper transcribes), its windows one after another.
 """
 
 import argparse
@@ -38,6 +40,8 @@ def main() -> None:
     ap.add_argument("--batch", nargs="+", type=int, default=[8])
     ap.add_argument("--backend", default="tensorrt")
     ap.add_argument("--dtype", default="float16")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--single", action="store_true")
     ap.add_argument("--out")
     args = ap.parse_args()
     data = np.load(args.waves)
@@ -51,23 +55,31 @@ def main() -> None:
     for batch in args.batch:
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-        res = model.transcribe(waves, args.lang, word_timestamps=args.word_timestamps, batch_size=batch)
+        groups = [[w] for w in waves] if args.single else [waves]
+        res = [segs for g in groups for segs in model.transcribe(g, args.lang, word_timestamps=args.word_timestamps,
+                                                                 batch_size=batch, seed=args.seed)]
         torch.cuda.synchronize()
         sec = time.perf_counter() - t0
         rows = [[{"start": s.start, "end": s.end, "text": s.text, "tokens": s.tokens, "temperature": s.temperature,
                   "words": [[w.start, w.end, w.word, w.probability] for w in s.words] if s.words else None}
                  for s in segs] for segs in res]
         out[f"b{batch}"] = rows
-        print(f"{args.backend}/{args.dtype} batch {batch}: RTFx {audio_s / sec:.1f} ({sec:.1f} s for {audio_s:.0f} s)",
+        print(f"{args.backend}/{args.dtype} batch {batch}{' one recording at a time' if args.single else ''}: RTFx {audio_s / sec:.1f} ({sec:.1f} s for {audio_s:.0f} s)",
               flush=True)
         for key, run in ref["runs"].items():
             same_rec, prefix, errs, n_units, word_d, fallback = 0, [], 0, 0, [], 0
+            det_same = det_total = det_rec = 0  # up to the first window either decodes by sampling
             for ours, theirs in zip(rows, run["recordings"]):
+                upto = min(next((i for i, s in enumerate(ours) if s["temperature"] > 0), len(ours)),
+                           next((i for i, s in enumerate(theirs) if s["temperature"] > 0), len(theirs)))
                 keyed = [(s["tokens"], round(s["start"], 3), round(s["end"], 3)) for s in ours]
                 ref_keyed = [(s["tokens"], round(s["start"], 3), round(s["end"], 3)) for s in theirs]
                 same_rec += keyed == ref_keyed
                 k = next((i for i, (a, b) in enumerate(zip(keyed, ref_keyed)) if a != b), min(len(keyed), len(ref_keyed)))
                 prefix.append(k / max(len(ref_keyed), 1))
+                det_same += min(k, upto)
+                det_total += upto
+                det_rec += k >= upto
                 a = units(" ".join(s["text"].strip() for s in ours))
                 b = units(" ".join(s["text"].strip() for s in theirs))
                 errs += edit_distance(a, b)
@@ -80,7 +92,8 @@ def main() -> None:
             line = (f"    vs {key} (RTFx {run['rtfx']:.1f}): recordings with the same segments {same_rec}/{len(rows)}, "
                     f"segments the same before the first difference {np.mean(prefix):.1%}, "
                     f"{'CER' if args.lang in CER_LANGS else 'WER'} of ours against it {errs / max(n_units, 1):.2%}, "
-                    f"its fallback segments {fallback}")
+                    f"its fallback segments {fallback}; before the first sampled window: segments the same "
+                    f"{det_same}/{det_total}, recordings {det_rec}/{len(rows)}")
             if word_d:
                 d = np.array(word_d)
                 line += (f"; words of the same segments: {len(d)}, same times {np.mean(d < 1e-6):.1%}, "

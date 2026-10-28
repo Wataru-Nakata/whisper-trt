@@ -30,6 +30,7 @@ ap.add_argument("--compute-types", nargs="+", default=["float32", "float16"])
 ap.add_argument("--configs", nargs="+", default=["1x1", "5x1", "5x8"], help="BEAMxBATCH")
 ap.add_argument("--save-features", type=int, default=3, help="features/encoder output of the first N")
 ap.add_argument("--repeat", type=int, default=2, help="timed passes after one warm-up pass")
+ap.add_argument("--timestamps", action="store_true", help="the prompt without <|notimestamps|> (timestamps)")
 args = ap.parse_args()
 
 data = np.load(args.waves)
@@ -41,7 +42,7 @@ out = {"meta": meta, "audio_seconds": audio_s, "runs": {}}
 for ct in args.compute_types:
     m = WhisperModel(args.model, device="cuda", compute_type=ct, local_files_only=Path(args.model).is_dir())
     tok = Tokenizer(m.hf_tokenizer, m.model.is_multilingual, task="transcribe", language=args.lang)
-    prompt = m.get_prompt(tok, [], without_timestamps=True)
+    prompt = m.get_prompt(tok, [], without_timestamps=not args.timestamps)
     suppress = list(get_suppressed_tokens(tok, [-1]))
     t0 = time.perf_counter()
     feats = np.stack([pad_or_trim(m.feature_extractor(w)[..., :-1]) for w in waves])

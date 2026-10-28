@@ -110,6 +110,7 @@ class Search:
         max_length: int = 448,
         graphs: bool | None = None,
         fused: bool | None = None,
+        timestamps: bool = False,
     ):
         if mode not in ("beam", "greedy", "sample"):
             raise ValueError(f"unknown search mode {mode!r}")
@@ -149,6 +150,13 @@ class Search:
         self.row_done = torch.ones(N, dtype=torch.bool, device=dev)  # greedy/sampling rows
         self.length = torch.zeros(N, dtype=torch.long, device=dev)  # greedy/sampling: tokens without EOS
         self.temperature = torch.ones(1, dtype=torch.float32, device=dev)
+        # decoding with timestamps (CTranslate2's ApplyTimestampRules, see _timestamp_rules)
+        self.timestamps = timestamps
+        if timestamps and not cfg.timestamp_begin:
+            raise ValueError("this model has no timestamp tokens")
+        self.max_initial = torch.full((1,), 50, dtype=torch.long, device=dev)  # (index past timestamp_begin)
+        self.vocab_ids = torch.arange(V, device=dev)
+        self.hist_ids = torch.arange(T, device=dev)
         self.seed = torch.zeros(1, dtype=torch.int64, device=dev)
         if mode == "sample":  # (row, token) counters of the random numbers, see _uniform
             self.counter = (torch.arange(N, device=dev)[:, None] * V + torch.arange(V, device=dev)).view(N, V)
@@ -183,8 +191,7 @@ class Search:
         if not getattr(self._step, "writes_cache", False):  # (a backend may write them into the cache itself)
             self.cache[:, :, self.row_ar, :, self.offset, :] = self.new_kv[:, :, :, :, 0, :].permute(2, 0, 1, 3, 4)
         if self.fused:  # the same as below, in three kernels
-            beam_kernels.scores(self.logits[:, 0], self.suppress, self.begin, self.t, self.cum, self.scores,
-                                self.ns, self.K, self.cfg.no_speech)
+            beam_kernels.scores(self, self.logits[:, 0], self.scores, self.ns)
             top_s, top_i = self.scores.view(self.B, -1).topk(2 * self.K, dim=1)
             beam_kernels.update(self, top_s, top_i, self.ns)
             return
@@ -216,6 +223,8 @@ class Search:
     def _choose(self, logits: torch.Tensor) -> None:
         first = (self.t == 0).repeat_interleave(self.K)[:, None]  # [N, 1]: a window's first step
         logits = logits.masked_fill(self.suppress, LOWEST).masked_fill(self.begin & first, LOWEST)
+        if self.timestamps:
+            logits = self._timestamp_rules(logits)
         logp = logits.log_softmax(-1)  # [N, V]
         prompt = (self.t < 0).repeat_interleave(self.K)  # [N]: rows still fed their prompt
         kept = (self.hist.clone(), self.cum.clone(), self.src.clone())
@@ -230,6 +239,33 @@ class Search:
         self.src.copy_(torch.where(prompt[:, None], src, self.src))
         nxt = self.forced.gather(1, (self.P + self.t).clamp(max=self.P)[:, None])[:, 0].repeat_interleave(self.K)
         self.tokens.copy_(torch.where(prompt, nxt, self.tokens[:, 0])[:, None])
+
+    def _timestamp_rules(self, logits: torch.Tensor) -> torch.Tensor:
+        """CTranslate2's ApplyTimestampRules (models/whisper.cc) on the suppressed logits [N, V], per row: never
+        <|notimestamps|>; a timestamp first, at most max_initial; then timestamps in pairs (after a pair, text;
+        after a lone timestamp, another one or EOS) and never decreasing; and where text may follow, text only if
+        some text token is likelier than all timestamps together (log-probabilities after the other rules)."""
+        c, K = self.cfg, self.K
+        tb, v = c.timestamp_begin, self.vocab_ids[None, :]
+        t = self.t.repeat_interleave(K).clamp(min=0)  # [N] tokens generated
+        first = t == 0
+        last = self.hist.gather(1, (t - 1).clamp(min=0)[:, None])[:, 0]
+        pen = torch.where(t >= 2, self.hist.gather(1, (t - 2).clamp(min=0)[:, None])[:, 0], last)
+        last_ts, pen_ts = last >= tb, pen >= tb
+        # the latest timestamp generated
+        is_ts = (self.hist >= tb) & (self.hist_ids[None, :] < t[:, None])
+        at = torch.where(is_ts, self.hist_ids[None, :], -1).max(1).values
+        latest = self.hist.gather(1, at.clamp(min=0)[:, None])[:, 0]
+        mask = (v == c.no_timestamps) | (first[:, None] & ((v < tb) | (v > tb + self.max_initial)))
+        mask |= (~first & last_ts & pen_ts)[:, None] & (v >= tb)
+        pair = ~first & last_ts & ~pen_ts
+        mask |= pair[:, None] & ((v < c.eot) | ((v >= tb) & (v < last[:, None])))
+        mask |= (~first & ~last_ts & (at >= 0))[:, None] & (v >= tb) & (v <= latest[:, None])
+        logits = logits.masked_fill(mask, LOWEST)
+        lp = logits.log_softmax(-1)
+        sample_ts = lp[:, tb:].logsumexp(-1) > lp[:, :tb].max(-1).values
+        check = pair | (~first & ~last_ts)
+        return logits.masked_fill((check & sample_ts)[:, None] & (v < tb), LOWEST)
 
     def _uniform(self) -> torch.Tensor:
         """Uniform random numbers [N, V] in (0, 1) from a counter-based hash (PCG's output function, on 32-bit
@@ -349,6 +385,7 @@ class Search:
         seed: int = 0,
         check_every: int = 1,
         ahead: int = 1,
+        max_initial_timestamp_index: int = 50,
     ) -> list[WindowResult]:
         """Decode len(prompts) windows (prompts of length P), at most B at a time: a slot whose window is done
         takes the next one. ``load(slots, windows)`` puts the windows' cross-attention keys/values into those
@@ -366,6 +403,7 @@ class Search:
         if begin_suppress:
             self.begin[torch.tensor(list(begin_suppress), device=self.device)] = True
         self.temperature.fill_(temperature)
+        self.max_initial.fill_(max_initial_timestamp_index)
         self.seed.fill_(seed & 0x7FFFFFFF)
         self.done.fill_(True)
         self.row_done.fill_(True)
@@ -422,10 +460,11 @@ class Search:
         return results
 
     def run(self, prompt: torch.Tensor, suppress: list[int], begin_suppress: list[int], temperature: float = 1.0,
-            seed: int = 0, check_every: int = 1, ahead: int = 1) -> list[WindowResult]:
+            seed: int = 0, check_every: int = 1, ahead: int = 1,
+            max_initial_timestamp_index: int = 50) -> list[WindowResult]:
         """The B windows whose cross-attention keys/values are already in the slots (``prompt`` [B, P])."""
         return self.stream(prompt.tolist(), lambda slots, windows: None, suppress, begin_suppress, temperature,
-                           seed, check_every, ahead)
+                           seed, check_every, ahead, max_initial_timestamp_index)
 
     def _final_state(self, slots: list[int]) -> tuple:
         """What the results of the windows in ``slots`` (all done) are made of, copied to the host

@@ -27,6 +27,7 @@ def main(argv: list[str] | None = None) -> None:
     t.add_argument("--task", default="transcribe", choices=("transcribe", "translate"))
     t.add_argument("--beam-size", type=int, default=5)
     t.add_argument("--json", action="store_true", help="every value per recording, as JSON lines")
+    t.add_argument("--timestamps", action="store_true", help="decode with timestamps: segments per recording")
     args = ap.parse_args(argv)
 
     from . import Whisper
@@ -37,13 +38,18 @@ def main(argv: list[str] | None = None) -> None:
         print("engines ready", file=sys.stderr)
     elif args.cmd == "transcribe":
         out = model.decode_windows(args.audio, args.language, args.task, beam_size=args.beam_size,
-                                   batch_size=args.batch_size)
+                                   batch_size=args.batch_size, without_timestamps=not args.timestamps)
         for path, d in zip(args.audio, out):
             if args.json:
                 row = {"audio": path, "text": d.text, "avg_logprob": d.avg_logprob, "no_speech_prob": d.no_speech_prob,
                        "compression_ratio": d.compression_ratio, "temperature": d.temperature,
                        "reached_max_length": d.reached_max_length}
+                if args.timestamps:
+                    row["segments"] = [{k: seg[k] for k in ("start", "end", "text")} for seg in d.segments]
                 print(json.dumps(row, ensure_ascii=False))
+            elif args.timestamps:
+                for seg in d.segments:
+                    print(f"{path}\t[{seg['start']:.2f} -> {seg['end']:.2f}]\t{seg['text'].strip()}")
             else:
                 print(f"{path}\t{d.text}")
     else:

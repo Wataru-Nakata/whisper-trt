@@ -14,11 +14,12 @@ import torch
 
 from . import hub
 from .audio import AudioLike, load_audio
-from .config import N_FRAMES, WhisperConfig, load_config
+from .config import N_FRAMES, SAMPLE_RATE, TIME_PRECISION, WhisperConfig, load_config
 from .features import log_mel
 from .modeling import load_model
 from .runtime import TorchBackend, TritonDecoderBackend, TRTBackend
 from .search import Search, WindowResult
+from .segments import split_segments
 from .tokenizer import Tokenizer
 
 log = logging.getLogger(__name__)
@@ -43,6 +44,8 @@ class Decoded:
     temperature: float
     reached_max_length: bool
     attempts: list[dict] = field(default_factory=list)  # earlier temperatures' decodes (fallback)
+    # decoded with timestamps: faster-whisper's segments of the window ({"start", "end", "text", "tokens"}, s)
+    segments: list[dict] = field(default_factory=list)
 
 
 def _on_stream(fn):
@@ -179,13 +182,18 @@ class Whisper:
         self.backend.encode(feats.to(self.device, torch.float32).contiguous(), cross)
         return cross
 
-    def _search(self, mode: str, windows: int, rows: int, prompt_length: int) -> Search:
-        key = (mode, windows, rows, prompt_length)
+    def _search(self, mode: str, windows: int, rows: int, prompt_length: int, timestamps: bool = False) -> Search:
+        key = (mode, windows, rows, prompt_length, timestamps)
         if key not in self._searches:
             step = partial(self.backend.step_fn, cross=self.cross(windows))
             self._searches[key] = Search(self.cfg, step, windows, rows, prompt_length, mode,
-                                         dtype=self.backend.dtype, device=self.device)
+                                         dtype=self.backend.dtype, device=self.device, timestamps=timestamps)
         return self._searches[key]
+
+    def _timestamps(self, prompt: list[int]) -> bool:
+        """Whether a prompt decodes with timestamps: as CTranslate2 decides, unless it ends with
+        <|notimestamps|>."""
+        return prompt[-1] != self.cfg.no_timestamps
 
     def _decoder(self, key: tuple, tokens: torch.Tensor, cache: torch.Tensor, src: torch.Tensor,
                  cross: torch.Tensor) -> torch.Tensor:
@@ -235,27 +243,27 @@ class Whisper:
         suppress_tokens: tuple[int, ...] | None = (-1,),
         suppress_blank: bool = True,
         seed: int = 0,
+        max_initial_timestamp_index: int = 50,
     ) -> list[WindowResult]:
         """CTranslate2's ``Whisper.generate`` on encoded windows (``cross`` from :meth:`encode`), as
         faster-whisper calls it: beam search at temperature 0 (greedy for ``beam_size=1``), else ``best_of``
         samples (``seed``: their random numbers; the same seed, the same samples). ``prompt``: one for all
-        windows or one per window (all of the same length)."""
+        windows or one per window (all of the same length); without <|notimestamps|> at its end the decodes
+        have timestamps (CTranslate2's timestamp rules; the first at most ``max_initial_timestamp_index``)."""
         windows = cross.shape[2]
         prompts = [prompt] * windows if not prompt or isinstance(prompt[0], int) else prompt
         if len({len(p) for p in prompts}) != 1:
             raise ValueError("every window's prompt must have the same length")
-        if not self.cfg.timestamp_begin or prompts[0][-1] != self.cfg.no_timestamps:
-            raise NotImplementedError("decoding with timestamps is not supported yet")
         if temperature > 0:
             mode, rows = "sample", best_of
         else:
             mode, rows = ("beam", beam_size) if beam_size > 1 else ("greedy", 1)
-        search = self._search(mode, windows, rows, len(prompts[0]))
+        search = self._search(mode, windows, rows, len(prompts[0]), self._timestamps(prompts[0]))
         suppress = self.tokenizer.suppressed_tokens(suppress_tokens)
         begin = self.cfg.begin_suppress_tokens if suppress_blank else ()
         rows_t = torch.tensor(prompts, dtype=torch.long)
         return search.run(rows_t, list(suppress), list(begin), temperature=temperature if temperature > 0 else 1.0,
-                          seed=seed)
+                          seed=seed, max_initial_timestamp_index=max_initial_timestamp_index)
 
     @_on_stream
     def decode(
@@ -269,6 +277,7 @@ class Whisper:
         suppress_tokens: tuple[int, ...] | None = (-1,),
         suppress_blank: bool = True,
         seed: int = 0,
+        max_initial_timestamp_index: int = 50,
     ) -> list[WindowResult]:
         """:meth:`generate` for any number of up-to-30 s windows, ``batch_size`` decoding at a time: a slot
         whose window is done takes the next window (its features computed and encoded then), so no window
@@ -282,7 +291,7 @@ class Whisper:
         slots = min(batch_size, len(audio))
         if slots > self.max_batch:
             raise ValueError(f"at most {self.max_batch} windows at a time")
-        search = self._search(mode, slots, rows, len(prompt))
+        search = self._search(mode, slots, rows, len(prompt), self._timestamps(prompt))
         cross = self.cross(slots)
         at_once = slots <= self.encode_batch  # the first windows in one encoder call (else one by one, ahead)
         ahead = _Prefetch(self, audio, ring=min(slots, len(audio) - slots, 8) if at_once else min(len(audio), 8))
@@ -299,7 +308,8 @@ class Whisper:
         suppress = self.tokenizer.suppressed_tokens(suppress_tokens)
         begin = self.cfg.begin_suppress_tokens if suppress_blank else ()
         return search.stream([prompt] * len(audio), load, list(suppress), list(begin),
-                             temperature=temperature if temperature > 0 else 1.0, seed=seed)
+                             temperature=temperature if temperature > 0 else 1.0, seed=seed,
+                             max_initial_timestamp_index=max_initial_timestamp_index)
 
     @_on_stream
     def detect_language(self, cross: torch.Tensor) -> list[list[tuple[str, float]]]:
@@ -337,13 +347,18 @@ class Whisper:
         suppress_blank: bool = True,
         batch_size: int = 8,
         seed: int = 0,
+        without_timestamps: bool = True,
+        max_initial_timestamp: float = 1.0,
     ) -> list[Decoded]:
-        """Up-to-30 s windows decoded on their own (no timestamps, no previous text), each as faster-whisper's
+        """Up-to-30 s windows decoded on their own (no previous text), each as faster-whisper's
         ``generate_with_fallback`` decodes a window, batched: every temperature decodes the windows still
         unsettled at it together, ``batch_size`` at a time with refilled slots (:meth:`decode`). ``seed``: the
-        sampling's random numbers (the windows' order and the seed give the same samples)."""
+        sampling's random numbers (the windows' order and the seed give the same samples).
+        ``without_timestamps=False``: decoded with timestamps (the first at most ``max_initial_timestamp``
+        seconds), each result with faster-whisper's segments of its window."""
         waves = [a if isinstance(a, torch.Tensor) and a.dim() == 1 else load_audio(a) for a in audio]
-        prompt = self.prompt(language, task, without_timestamps=True)
+        prompt = self.prompt(language, task, without_timestamps=without_timestamps)
+        max_initial = int(round(max_initial_timestamp / TIME_PRECISION))
         n = len(waves)
         attempts: list[list[dict]] = [[] for _ in range(n)]
         final: list[Decoded | None] = [None] * n
@@ -352,7 +367,8 @@ class Whisper:
             if not pending:
                 break
             results = self.decode([waves[i] for i in pending], prompt, beam_size, temperature, best_of,
-                                  batch_size, suppress_tokens, suppress_blank, seed=seed + round_)
+                                  batch_size, suppress_tokens, suppress_blank, seed=seed + round_,
+                                  max_initial_timestamp_index=max_initial)
             nxt = []
             for i, r in zip(pending, results):
                 text = self.tokenizer.decode(r.tokens).strip()
@@ -370,6 +386,11 @@ class Whisper:
                   or a["compression_ratio"] <= compression_ratio_threshold]
             best = max(ok or attempts[i], key=lambda a: a["avg_logprob"])
             final[i] = _decoded({**best, "temperature": attempts[i][-1]["temperature"]}, attempts[i])
+        if not without_timestamps:
+            for i, d in enumerate(final):
+                duration = min(len(waves[i]) / SAMPLE_RATE, N_FRAMES / 100)
+                d.segments = [{**seg, "text": self.tokenizer.decode(seg["tokens"])} for seg in
+                              split_segments(d.tokens, self.cfg.timestamp_begin, duration)]
         return final
 
 

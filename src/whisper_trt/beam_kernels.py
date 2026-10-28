@@ -2,8 +2,9 @@
 of ~80 small PyTorch kernels (0.3-0.6 ms a step at 8-32 windows).
 
 * :func:`scores`: per row, the suppressed (and, at a window's first step, begin-suppressed) tokens set to the
-  lowest float, log-softmax, plus the row's cumulative log-probability: the K x V scores of each window's
-  candidates; and each window's no-speech probability from its unmasked logits.
+  lowest float, with timestamps also those CTranslate2's ApplyTimestampRules disables (as
+  ``Search._timestamp_rules``), log-softmax, plus the row's cumulative log-probability: the K x V scores of each
+  window's candidates; and each window's no-speech probability from its unmasked logits.
 * the best 2K of each window's K x V scores (``torch.topk``).
 * :func:`update`: per window, CTranslate2's rules as ``Search._beam`` / ``_choose`` / ``_body`` apply them: the
   first K candidates that end (EOS, or any at the last step) become finished hypotheses, each ended one gives its
@@ -27,34 +28,89 @@ LOWEST = torch.finfo(torch.float32).min
 if triton is not None:
 
     @triton.jit
-    def _scores_kernel(logits, suppress, begin, t, cum, out, ns, V, NO_SPEECH, K: tl.constexpr,
-                       LOW: tl.constexpr, BV: tl.constexpr):  # fmt: skip
+    def _mask(v, ok, suppress, begin, first, TS: tl.constexpr, NOTS, TSB, EOT, max_init, first_ts, both, pair,
+              fresh, last, latest):  # fmt: skip
+        """The tokens a row may not take: suppressed ones, at a window's first step the begin-suppressed ones,
+        and with timestamps CTranslate2's ApplyTimestampRules (before its probability check)."""
+        m = tl.load(suppress + v, mask=ok, other=0) | (tl.load(begin + v, mask=ok, other=0) & first)
+        if TS:
+            ts = v >= TSB
+            m |= v == NOTS
+            m |= first_ts & (~ts | (v > TSB + max_init))
+            m |= both & ts
+            m |= pair & ((v < EOT) | (ts & (v < last)))
+            m |= fresh & ts & (v <= latest)
+        return m
+
+    @triton.jit
+    def _scores_kernel(logits, suppress, begin, t, cum, out, ns, hist, max_initial, V, NO_SPEECH, NOTS, TSB, EOT,
+                       K: tl.constexpr, T: tl.constexpr, TS: tl.constexpr, LOW: tl.constexpr, BV: tl.constexpr,
+                       TB: tl.constexpr):  # fmt: skip
         r = tl.program_id(0)
         b = r // K
-        first = tl.load(t + b) == 0
+        tw = tl.load(t + b)
+        first = tw == 0
         base = r.to(tl.int64) * V
+        # with timestamps: the row's last two tokens and latest timestamp (its history, positions < t)
+        first_ts, both, pair, fresh, check = first, first, first, first, first
+        last = tl.zeros((), tl.int64)
+        latest = tl.zeros((), tl.int64)
+        max_init = tl.zeros((), tl.int64)
+        if TS:
+            g = tl.maximum(tw, 0)
+            j = tl.arange(0, TB)
+            h = tl.load(hist + r.to(tl.int64) * T + j, mask=j < T, other=0)
+            last = tl.sum(tl.where(j == g - 1, h, 0), 0)
+            pen = tl.where(g >= 2, tl.sum(tl.where(j == g - 2, h, 0), 0), last)
+            at = tl.max(tl.where((j < g) & (h >= TSB), j, -1), 0)
+            latest = tl.sum(tl.where(j == at, h, 0), 0)
+            first_ts = g == 0
+            last_ts, pen_ts = last >= TSB, pen >= TSB
+            both = ~first_ts & last_ts & pen_ts
+            pair = ~first_ts & last_ts & ~pen_ts
+            fresh = ~first_ts & ~last_ts & (at >= 0)
+            check = pair | (~first_ts & ~last_ts)
+            max_init = tl.load(max_initial)
         m_raw = tl.full((), float("-inf"), tl.float32)
         m_msk = tl.full((), float("-inf"), tl.float32)
+        m_ts = tl.full((), float("-inf"), tl.float32)
+        mx_text = tl.full((), float("-inf"), tl.float32)
         s_raw = tl.zeros((), tl.float32)
         s_msk = tl.zeros((), tl.float32)
+        s_ts = tl.zeros((), tl.float32)
         for v0 in range(0, V, BV):  # online maxima and sums of exp
             v = v0 + tl.arange(0, BV)
             ok = v < V
             x = tl.load(logits + base + v, mask=ok, other=float("-inf"))
-            masked = tl.load(suppress + v, mask=ok, other=0) | (tl.load(begin + v, mask=ok, other=0) & first)
+            masked = _mask(v, ok, suppress, begin, first, TS, NOTS, TSB, EOT, max_init, first_ts, both, pair, fresh,
+                           last, latest)
             xm = tl.where(ok, tl.where(masked, LOW, x), float("-inf"))
             n_raw = tl.maximum(m_raw, tl.max(x, 0))
             n_msk = tl.maximum(m_msk, tl.max(xm, 0))
             s_raw = s_raw * tl.exp(m_raw - n_raw) + tl.sum(tl.exp(x - n_raw), 0)
             s_msk = s_msk * tl.exp(m_msk - n_msk) + tl.sum(tl.exp(xm - n_msk), 0)
             m_raw, m_msk = n_raw, n_msk
+            if TS:  # the timestamps' sum and the text tokens' max, for the probability check
+                xt = tl.where(v >= TSB, xm, float("-inf"))
+                n_ts = tl.maximum(m_ts, tl.max(xt, 0))
+                s_ts = s_ts * tl.exp(m_ts - n_ts) + tl.sum(tl.exp(xt - n_ts), 0)
+                m_ts = n_ts
+                mx_text = tl.maximum(mx_text, tl.max(tl.where(v < TSB, xm, float("-inf")), 0))
         log_sum = tl.log(s_msk)
+        text_out = first & ~first  # (False) text masked: a timestamp is likelier than every text token
+        if TS:
+            lse = m_msk + log_sum
+            text_out = check & ((m_ts - lse) + tl.log(s_ts) > mx_text - lse)
+            m_msk = tl.where(text_out, m_ts, m_msk)
+            log_sum = tl.where(text_out, tl.log(s_ts), log_sum)
         c = tl.load(cum + r)
         for v0 in range(0, V, BV):
             v = v0 + tl.arange(0, BV)
             ok = v < V
             x = tl.load(logits + base + v, mask=ok, other=0.0)
-            masked = tl.load(suppress + v, mask=ok, other=0) | (tl.load(begin + v, mask=ok, other=0) & first)
+            masked = _mask(v, ok, suppress, begin, first, TS, NOTS, TSB, EOT, max_init, first_ts, both, pair, fresh,
+                           last, latest)
+            masked |= text_out & (v < TSB)
             xm = tl.where(masked, LOW, x)
             tl.store(out + base + v, (xm - m_msk - log_sum) + c, mask=ok)
         if r % K == 0:
@@ -136,12 +192,16 @@ if triton is not None:
                 tl.store(t + b, tb + 1)
 
 
-def scores(logits: torch.Tensor, suppress: torch.Tensor, begin: torch.Tensor, t: torch.Tensor, cum: torch.Tensor,
-           out: torch.Tensor, ns: torch.Tensor, k: int, no_speech: int) -> None:
-    """``out`` [N, V] = log_softmax(masked logits [N, V]) + cum[:, None]; ``ns`` [B]: no-speech probabilities."""
+def scores(s, logits: torch.Tensor, out: torch.Tensor, ns: torch.Tensor) -> None:
+    """``out`` [N, V] = log_softmax(masked logits [N, V]) + cum[:, None] for ``s`` (a search.Search in beam mode:
+    its suppressed tokens, its windows' steps, and with ``s.timestamps`` the timestamp rules on its rows'
+    histories); ``ns`` [B]: no-speech probabilities."""
     n, v = logits.shape
-    _scores_kernel[(n,)](logits, suppress, begin, t, cum, out, ns, v, no_speech, K=k, LOW=LOWEST, BV=4096,
-                         num_warps=8)
+    c = s.cfg
+    T = s.hist.shape[1]
+    _scores_kernel[(n,)](logits, s.suppress, s.begin, s.t, s.cum, out, ns, s.hist, s.max_initial, v, c.no_speech,
+                         c.no_timestamps, c.timestamp_begin or 0, c.eot, K=s.K, T=T, TS=s.timestamps, LOW=LOWEST,
+                         BV=4096, TB=triton.next_power_of_2(T), num_warps=8)
 
 
 def update(s, top_s: torch.Tensor, top_i: torch.Tensor, ns: torch.Tensor) -> None:

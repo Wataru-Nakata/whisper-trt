@@ -115,6 +115,7 @@ def main() -> None:
                     help="all windows through refilled slots (Whisper.decode) instead of fixed batches")
     ap.add_argument("--out")
     ap.add_argument("--report", help="every window that differs from the reference, as JSON")
+    ap.add_argument("--timestamps", action="store_true", help="decode with timestamps (the reference too)")
     args = ap.parse_args()
     global UNITS
     UNITS = chars if args.lang in CER_LANGS else words
@@ -146,7 +147,7 @@ def main() -> None:
             d = (enc - e).abs()
             print(f"encoder: max |diff| {d.max():.3g} mean {d.mean():.3g} (ref max |x| {e.abs().max():.3g})")
 
-    prompt = model.prompt(args.lang, without_timestamps=True)
+    prompt = model.prompt(args.lang, without_timestamps=not args.timestamps)
     out, report = {}, {}
     for cfg in args.configs:
         beam, batch = map(int, cfg.split("x"))

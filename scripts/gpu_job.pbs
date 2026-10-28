@@ -44,9 +44,9 @@ if [[ -n "$REF_CMD" || "$CMD" == *.sh* ]] && [ -f "$REF_TAR" ]; then
   unpack "$REF_TAR"
   REF_VENV=$PBS_LOCALDIR/fw-ref
   REF_BIN=$REF_VENV/bin/python3
-else  # (before the tar exists: a venv on /groups)
-  REF_VENV=.cache/fw-ref-venv
-  REF_BIN=$REF_VENV/bin/python
+else  # (no reference env: scripts/build_env_tar.sh ref builds it)
+  REF_VENV=""
+  REF_BIN=false
 fi
 REF_LIBS=$(ls -d "$REF_VENV"/lib/python3.12/site-packages/nvidia/*/lib 2>/dev/null | paste -sd:)
 REF_PY="env LD_LIBRARY_PATH=$REF_LIBS $REF_BIN"

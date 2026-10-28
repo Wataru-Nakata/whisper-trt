@@ -29,10 +29,10 @@ whisper-trt detect-language a.wav
 
 ## Speed
 
-One H200, `openai/whisper-large-v3`, fp16, the language forced, no timestamps, beam 5 (the first pass of
-a clip-transcription workload). RTFx: seconds of audio per second of features + encoder + decoding, best of two
-passes; faster-whisper 1.2.1 (CTranslate2 4.8.2, fp16) decodes batches of 8 windows as its batched pipeline does
-(encoder + generate in one pass; its features computed apart).
+One H200, `openai/whisper-large-v3`, fp16, the language forced, no timestamps, beam 5. RTFx: seconds of audio
+per second of features + encoder + decoding, best of two passes; faster-whisper 1.2.1 (CTranslate2 4.8.2, fp16)
+decodes batches of 8 windows as its batched pipeline does (encoder + generate in one pass; its features computed
+apart).
 
 | set | faster-whisper, batch 8 | **whisper-trt, 8 slots** | **16 slots** | **32 slots** |
 |---|---:|---:|---:|---:|
@@ -194,9 +194,6 @@ without VAD.
 
 ## Limitations
 
-* Decoding with timestamps (and so `transcribe`-style long-form decoding and word timestamps), prompts with
-  previous text and `initial_prompt` are not implemented yet; windows are decoded on their own, as
-  faster-whisper's batched pipeline decodes clips.
 * Every input is one window of at most 30 s: longer audio is trimmed, not chunked (features are normalized
   over the whole input, as faster-whisper normalizes a clip).
 * Tested with torch 2.14.1 (CUDA 13) + TensorRT 11.4.0.106 on H200 only.

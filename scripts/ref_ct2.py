@@ -12,6 +12,7 @@ penalties, max_length 448).
 import argparse
 import json
 import time
+from pathlib import Path
 
 import numpy as np
 from faster_whisper import WhisperModel
@@ -22,7 +23,8 @@ from faster_whisper.transcribe import get_ctranslate2_storage, get_suppressed_to
 ap = argparse.ArgumentParser()
 ap.add_argument("waves")
 ap.add_argument("out")
-ap.add_argument("--model", default=".cache/fw-large-v3")
+# faster-whisper's large-v3 (CTranslate2 format): a directory (by default .cache/fw-large-v3) or a Hugging Face id
+ap.add_argument("--model", default=str(Path(__file__).resolve().parents[1] / ".cache" / "fw-large-v3"))
 ap.add_argument("--lang", default="en")
 ap.add_argument("--compute-types", nargs="+", default=["float32", "float16"])
 ap.add_argument("--configs", nargs="+", default=["1x1", "5x1", "5x8"], help="BEAMxBATCH")
@@ -37,7 +39,7 @@ waves = [w.astype(np.float32) / 32768 if w.dtype == np.int16 else w for w in wav
 audio_s = sum(len(w) for w in waves) / 16000
 out = {"meta": meta, "audio_seconds": audio_s, "runs": {}}
 for ct in args.compute_types:
-    m = WhisperModel(args.model, device="cuda", compute_type=ct, local_files_only=True)
+    m = WhisperModel(args.model, device="cuda", compute_type=ct, local_files_only=Path(args.model).is_dir())
     tok = Tokenizer(m.hf_tokenizer, m.model.is_multilingual, task="transcribe", language=args.lang)
     prompt = m.get_prompt(tok, [], without_timestamps=True)
     suppress = list(get_suppressed_tokens(tok, [-1]))

@@ -23,7 +23,7 @@ for lang in ja en de hi ta el; do
     2>&1 | grep -E "^beam|vs float|Traceback|Error"
 done
 echo "=== captions"
-$PY scripts/yodas_captions.py --eval-dir $E --ours "$OUT/ours-yodas-{lang}.json" --langs ja en de zh ko hi ta el ar ru es fr pt vi th it id tr 2>&1 | tail -25
+uv run --no-project --with pyarrow python scripts/yodas_captions.py --eval-dir $E --ours "$OUT/ours-yodas-{lang}.json" --langs ja en de zh ko hi ta el ar ru es fr pt vi th it id tr 2>&1 | tail -25
 echo "=== timing"
 for spec in ls-test-clean:en jvs-test:ja yodas-ja:ja yodas-en:en yodas-hi:hi; do
   name=${spec%%:*}; lang=${spec#*:}

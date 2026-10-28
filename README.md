@@ -216,7 +216,8 @@ snapshot of the code. `scripts/build_env_tar.sh` builds them (from `uv.lock`):
 * `scripts/smoke_workload.py`: language identification and `decode_windows` (with `--force-fallback`, every
   window through every temperature) on clips.
 * `scripts/make_eval_yodas.py`, `scripts/prepare_waves.py`: the evaluation sets (`.cache/eval`);
-  `scripts/mismatch_summary.py`, `scripts/ct2_vs_ct2.py`, `scripts/yodas_captions.py`: their analysis.
+  `scripts/mismatch_summary.py`, `scripts/ct2_vs_ct2.py`, `scripts/yodas_captions.py`: their analysis
+  (`yodas_captions.py` needs pyarrow, in neither environment: `uv run --no-project --with pyarrow python ...`).
 * `scripts/profile_stream.py`, `scripts/profile_decode.py`, `scripts/trt_profile.py`, `scripts/bench_decoder.py`:
   time per part of a streamed decode / per stage / per TensorRT layer / per decoder step;
   `scripts/profile_body.py` (decoder call against beam bookkeeping), `scripts/profile_triton_decoder.py` (per

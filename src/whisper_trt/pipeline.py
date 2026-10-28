@@ -5,6 +5,7 @@ import hashlib
 import logging
 import re
 import zlib
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
@@ -154,7 +155,16 @@ class Whisper:
     @_on_stream
     def features(self, audio: list[AudioLike]) -> torch.Tensor:
         """[W, n_mels, 3000] features of up-to-30 s windows (each normalized on its own, like faster-whisper's
-        batched pipeline)."""
+        batched pipeline); an item that already is features ([n_mels, 3000], e.g. a window of a long
+        recording's) is taken as it is."""
+        return self._features(audio)
+
+    def _features(self, audio: list[AudioLike]) -> torch.Tensor:
+        """:meth:`features` on the current stream."""
+        if all(isinstance(a, torch.Tensor) and a.dim() == 2 for a in audio):
+            return torch.stack([a.to(self.device, torch.float32) for a in audio])
+        if any(isinstance(a, torch.Tensor) and a.dim() == 2 for a in audio):
+            return torch.cat([self._features([a]) for a in audio])
         waves = [a if isinstance(a, torch.Tensor) and a.dim() == 1 else load_audio(a) for a in audio]
         return log_mel(waves, self.cfg.n_mels, self.device, N_FRAMES)
 
@@ -269,7 +279,7 @@ class Whisper:
     def decode(
         self,
         audio: list[AudioLike],
-        prompt: list[int],
+        prompt: list[int] | list[list[int]],
         beam_size: int = 5,
         temperature: float = 0.0,
         best_of: int = 5,
@@ -281,9 +291,16 @@ class Whisper:
     ) -> list[WindowResult]:
         """:meth:`generate` for any number of up-to-30 s windows, ``batch_size`` decoding at a time: a slot
         whose window is done takes the next window (its features computed and encoded then), so no window
-        waits for the slowest of a batch."""
+        waits for the slowest of a batch. ``prompt``: one for every window, or one per window; prompts with
+        previous text, or of different lengths, are run in one decoder call before their window's decode (as
+        CTranslate2 runs them), the others token by token in its first steps."""
         if not audio:
             return []
+        prompts = [prompt] * len(audio) if not prompt or isinstance(prompt[0], int) else list(prompt)
+        timestamps = {self._timestamps(p) for p in prompts}
+        if len(timestamps) != 1:
+            raise ValueError("every window decodes with timestamps, or none does")
+        prefilled = len({len(p) for p in prompts}) > 1 or any(p.index(self.cfg.sot) > 0 for p in prompts)
         if temperature > 0:
             mode, rows = "sample", best_of
         else:
@@ -291,14 +308,14 @@ class Whisper:
         slots = min(batch_size, len(audio))
         if slots > self.max_batch:
             raise ValueError(f"at most {self.max_batch} windows at a time")
-        search = self._search(mode, slots, rows, len(prompt), self._timestamps(prompt))
+        search = self._search(mode, slots, rows, None if prefilled else len(prompts[0]), timestamps.pop())
         cross = self.cross(slots)
         at_once = slots <= self.encode_batch  # the first windows in one encoder call (else one by one, ahead)
         ahead = _Prefetch(self, audio, ring=min(slots, len(audio) - slots, 8) if at_once else min(len(audio), 8))
 
         def load(slot_ids: list[int], windows: list[int]) -> None:
             if at_once and slot_ids == list(range(slots)) and windows == list(range(slots)):
-                self.backend.encode(self.features([audio[w] for w in windows]), cross)
+                self.backend.encode(self._features([audio[w] for w in windows]), cross)
                 ahead.skip_to(slots)
             else:
                 for s_, w in zip(slot_ids, windows):
@@ -307,9 +324,33 @@ class Whisper:
 
         suppress = self.tokenizer.suppressed_tokens(suppress_tokens)
         begin = self.cfg.begin_suppress_tokens if suppress_blank else ()
-        return search.stream([prompt] * len(audio), load, list(suppress), list(begin),
+        return search.stream(prompts, load, list(suppress), list(begin),
                              temperature=temperature if temperature > 0 else 1.0, seed=seed,
-                             max_initial_timestamp_index=max_initial_timestamp_index)
+                             max_initial_timestamp_index=max_initial_timestamp_index,
+                             prefill=self._prefill(search, cross) if prefilled else None)
+
+    def _prefill(self, search: Search, cross: torch.Tensor) -> Callable[[list[int], list[list[int]]], None]:
+        """Search.stream's prefill: each window's prompt but its last token in one decoder call (its slot's
+        keys/values), the keys/values into the slot's first row of the cache, the no-speech probability from the
+        logits at <|startoftranscript|>."""
+        c, K, dev = self.cfg, search.K, self.device
+        cache = torch.zeros(c.dec_layers, 2, 1, c.dec_heads, 16, c.head_dim, dtype=self.backend.dtype, device=dev)
+        src = torch.zeros(1, 16, dtype=torch.int32, device=dev)
+        offset = torch.zeros(1, dtype=torch.long, device=dev)
+
+        def prefill(slots: list[int], prompts: list[list[int]]) -> None:
+            for s, p in zip(slots, prompts):
+                n = len(p) - 1
+                tokens = torch.tensor([p[:-1]], dtype=torch.long, pin_memory=True).to(dev, non_blocking=True)
+                logits = torch.empty(1, n, c.vocab_size, dtype=torch.float32, device=dev)
+                new_kv = torch.empty(c.dec_layers, 2, 1, c.dec_heads, n, c.head_dim, dtype=self.backend.dtype,
+                                     device=dev)
+                self.backend.step_fn(tokens, offset, cache, logits, new_kv, src, cross=cross[:, :, s : s + 1])()
+                search.cache[:, :, s * K, :, :n] = new_kv[:, :, 0]
+                lg = logits[0, p.index(c.sot)]
+                search.no_speech[s : s + 1] = (lg[c.no_speech] - lg.logsumexp(-1)).exp()
+
+        return prefill
 
     @_on_stream
     def detect_language(self, cross: torch.Tensor) -> list[list[tuple[str, float]]]:
@@ -329,6 +370,31 @@ class Whisper:
         logits = self._decoder(key, rows, cache, src, self.cross(windows))[:, 0]
         probs = logits[:, list(c.lang_ids)].softmax(-1).tolist()
         return [sorted(zip(c.languages, p), key=lambda x: -x[1]) for p in probs]
+
+    def _torch_decoder(self):
+        """The PyTorch decoder on the model's weights (word timestamps)."""
+        dec = getattr(self.backend, "torch_decoder", None)
+        if dec is None and getattr(self.backend, "model", None) is not None:
+            dec = self.backend.model.decoder
+        if dec is None:
+            raise NotImplementedError("word timestamps need the Triton decoder or the PyTorch backend")
+        return dec
+
+    # --- long-form, with faster-whisper's rules -----------------------------------------------------------
+    @_on_stream
+    def transcribe(self, audio: list[AudioLike], language: str, task: str = "transcribe", **options):
+        """Recordings of any length transcribed as faster-whisper's ``WhisperModel.transcribe`` transcribes
+        each (``longform.transcribe``: window by window from a seek position, conditioned on the previous text,
+        with the temperature fallback, timestamps and optionally word timestamps), ``batch_size`` windows of
+        different recordings decoding at a time. Returns each recording's segments (longform.Segment, with
+        ``words`` if ``word_timestamps=True``). Options: those of faster-whisper's (beam_size, best_of,
+        temperatures, compression_ratio_threshold, log_prob_threshold, no_speech_threshold,
+        condition_on_previous_text, prompt_reset_on_temperature, initial_prompt, suppress_blank,
+        suppress_tokens, without_timestamps, max_initial_timestamp, word_timestamps, prepend_punctuations,
+        append_punctuations, hallucination_silence_threshold), batch_size, seed."""
+        from .longform import transcribe
+
+        return transcribe(self, audio, language, task, **options)
 
     # --- windows with faster-whisper's rules -----------------------------------------------------------
     @_on_stream
@@ -358,16 +424,32 @@ class Whisper:
         seconds), each result with faster-whisper's segments of its window."""
         waves = [a if isinstance(a, torch.Tensor) and a.dim() == 1 else load_audio(a) for a in audio]
         prompt = self.prompt(language, task, without_timestamps=without_timestamps)
-        max_initial = int(round(max_initial_timestamp / TIME_PRECISION))
-        n = len(waves)
+        final = self._fallback(waves, [prompt] * len(waves), beam_size, best_of, temperatures,
+                               compression_ratio_threshold, log_prob_threshold, no_speech_threshold, suppress_tokens,
+                               suppress_blank, batch_size, seed, int(round(max_initial_timestamp / TIME_PRECISION)))
+        if not without_timestamps:
+            for i, d in enumerate(final):
+                duration = min(len(waves[i]) / SAMPLE_RATE, N_FRAMES / 100)
+                d.segments = [{**seg, "text": self.tokenizer.decode(seg["tokens"])} for seg in
+                              split_segments(d.tokens, self.cfg.timestamp_begin, duration)]
+        return final
+
+    def _fallback(self, items: list, prompts: list[list[int]], beam_size: int, best_of: int,
+                  temperatures: tuple[float, ...], compression_ratio_threshold: float | None,
+                  log_prob_threshold: float | None, no_speech_threshold: float | None,
+                  suppress_tokens: tuple[int, ...] | None, suppress_blank: bool, batch_size: int, seed: int,
+                  max_initial: int) -> list[Decoded]:
+        """faster-whisper's ``generate_with_fallback`` for windows (waves or features) with their prompts: every
+        temperature decodes the windows still unsettled at it together (:meth:`decode`)."""
+        n = len(items)
         attempts: list[list[dict]] = [[] for _ in range(n)]
         final: list[Decoded | None] = [None] * n
         pending = list(range(n))
         for round_, temperature in enumerate(temperatures):
             if not pending:
                 break
-            results = self.decode([waves[i] for i in pending], prompt, beam_size, temperature, best_of,
-                                  batch_size, suppress_tokens, suppress_blank, seed=seed + round_,
+            results = self.decode([items[i] for i in pending], [prompts[i] for i in pending], beam_size,
+                                  temperature, best_of, batch_size, suppress_tokens, suppress_blank, seed=seed + round_,
                                   max_initial_timestamp_index=max_initial)
             nxt = []
             for i, r in zip(pending, results):
@@ -386,11 +468,6 @@ class Whisper:
                   or a["compression_ratio"] <= compression_ratio_threshold]
             best = max(ok or attempts[i], key=lambda a: a["avg_logprob"])
             final[i] = _decoded({**best, "temperature": attempts[i][-1]["temperature"]}, attempts[i])
-        if not without_timestamps:
-            for i, d in enumerate(final):
-                duration = min(len(waves[i]) / SAMPLE_RATE, N_FRAMES / 100)
-                d.segments = [{**seg, "text": self.tokenizer.decode(seg["tokens"])} for seg in
-                              split_segments(d.tokens, self.cfg.timestamp_begin, duration)]
         return final
 
 
@@ -421,9 +498,7 @@ class _Prefetch:
             with torch.cuda.stream(m.side_stream):
                 if self.copied[b] is not None:
                     m.side_stream.wait_event(self.copied[b])
-                a = self.audio[w]
-                wave = a if isinstance(a, torch.Tensor) and a.dim() == 1 else load_audio(a)
-                m.backend.encode(log_mel([wave], m.cfg.n_mels, m.device, N_FRAMES), self.bufs[b], lane=1)
+                m.backend.encode(m._features([self.audio[w]]), self.bufs[b], lane=1)
                 done = torch.cuda.Event()
                 done.record()
             self.staged[w] = (b, done)

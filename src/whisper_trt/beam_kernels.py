@@ -120,7 +120,7 @@ if triton is not None:
 
     @triton.jit
     def _update_kernel(top_s, top_i, t, pos, sot_pos, ns, no_speech, done, hist, cum, src, tokens, forced,
-                       h_count, h_score, h_len, h_tokens, V, EOT, MAX_NEW, P, K: tl.constexpr, T: tl.constexpr,
+                       h_count, h_score, h_len, h_tokens, last_t, V, EOT, P, K: tl.constexpr, T: tl.constexpr,
                        C: tl.constexpr, S: tl.constexpr, KB: tl.constexpr, TB: tl.constexpr,
                        CB: tl.constexpr):  # fmt: skip
         b = tl.program_id(0)
@@ -151,7 +151,7 @@ if triton is not None:
             tok, par = p_i % V, p_i // V
             s_tok, s_par = s_i % V, s_i // V
             eos = (tok == EOT) & jm
-            last = tb == MAX_NEW - 1
+            last = tb == tl.load(last_t + b)
             finish = (eos | last) & jm
             slot = tl.load(h_count + b) + tl.cumsum(finish.to(tl.int64), 0) - 1
             # each ended candidate's place: the r-th secondary candidate that does not end
@@ -211,7 +211,7 @@ def update(s, top_s: torch.Tensor, top_i: torch.Tensor, ns: torch.Tensor) -> Non
     T, C = s.hist.shape[1], s.src.shape[1]
     _update_kernel[(s.B,)](
         top_s, top_i, s.t, s.pos, s.sot_pos, ns, s.no_speech, s.done, s.hist, s.cum, s.src, s.tokens, s.forced,
-        s.h_count, s.h_score, s.h_len, s.h_tokens, s.cfg.vocab_size, s.cfg.eot, s.max_new, s.P, K=s.K, T=T, C=C,
+        s.h_count, s.h_score, s.h_len, s.h_tokens, s.last_t, s.cfg.vocab_size, s.cfg.eot, s.P, K=s.K, T=T, C=C,
         S=s.h_score.shape[1], KB=triton.next_power_of_2(s.K), TB=triton.next_power_of_2(T),
         CB=triton.next_power_of_2(C), num_warps=4,
     )  # fmt: skip

@@ -103,7 +103,7 @@ class Search:
         step_fn: Callable,
         batch: int,
         rows: int,
-        prompt_length: int,
+        prompt_length: int | None,
         mode: str = "beam",
         dtype: torch.dtype = torch.float16,
         device: str | torch.device = "cuda",
@@ -118,9 +118,12 @@ class Search:
             raise ValueError("greedy search has one row per window")
         self.cfg, self.mode, self.device = cfg, mode, torch.device(device)
         self.B, self.K, self.N = batch, rows, batch * rows
-        self.P = prompt_length
-        self.max_new = max_new_tokens(prompt_length, max_length)
-        self.capacity = C = prompt_length + self.max_new
+        # prompt_length None: prompts of any length, all but their last token prefilled (see stream)
+        self.prefilled = prompt_length is None
+        self.P = 1 if self.prefilled else prompt_length
+        self.max_length = max_length
+        self.max_new = max_length // 2 if self.prefilled else max_new_tokens(prompt_length, max_length)
+        self.capacity = C = max_length if self.prefilled else prompt_length + self.max_new
         L, H, dk, V = cfg.dec_layers, cfg.dec_heads, cfg.head_dim, cfg.vocab_size
         N, B, K, T = self.N, self.B, self.K, self.max_new
         dev = self.device
@@ -137,7 +140,8 @@ class Search:
         self.pos = torch.zeros(B, dtype=torch.long, device=dev)  # per slot: cache slot of the token fed next
         # per slot: tokens generated so far; negative while the prompt is fed (-(P-1) at its first token)
         self.t = torch.zeros(B, dtype=torch.long, device=dev)
-        self.forced = torch.zeros(B, prompt_length + 1, dtype=torch.long, device=dev)  # the slots' prompts
+        self.forced = torch.zeros(B, self.P + 1, dtype=torch.long, device=dev)  # the slots' prompts (fed by steps)
+        self.last_t = torch.full((B,), self.max_new - 1, dtype=torch.long, device=dev)  # per slot: its last step
         self.sot_pos = torch.zeros(B, dtype=torch.long, device=dev)  # position of <|startoftranscript|>
         self.no_speech = torch.zeros(B, dtype=torch.float32, device=dev)
         self.logits = torch.zeros(N, 1, V, dtype=torch.float32, device=dev)
@@ -293,7 +297,7 @@ class Search:
         score = logp.gather(1, token[:, None])[:, 0]
         self.cum += torch.where(live, score, 0.0)
         eos = token == self.cfg.eot
-        last = t == self.max_new - 1
+        last = t == self.last_t.repeat_interleave(self.K)
         keep = live & ~eos  # a generated token (EOS is not part of the hypothesis)
         self.hist.scatter_(1, t[:, None], torch.where(keep, token, self.hist.gather(1, t[:, None])[:, 0])[:, None])
         self.length += keep.long()
@@ -307,7 +311,7 @@ class Search:
         top_s, top_i = scores.topk(2 * K, dim=1)  # [B, 2K], best first
         tok, par = top_i % V, top_i // V
         eos = tok == self.cfg.eot
-        last = (self.t == self.max_new - 1)[:, None].expand(B, K)
+        last = (self.t == self.last_t)[:, None].expand(B, K)
         live = ~self.done[:, None] & ~prompt.view(B, K)[:, :1]
         finish = (eos[:, :K] | last) & live  # [B, K]: hypotheses registered this step
         # register them: slot count + rank, beyond the hypotheses' storage for the others
@@ -348,7 +352,9 @@ class Search:
     # --- driver -----------------------------------------------------------------------------------------
     def _start(self, slots: list[int], prompts: list[list[int]]) -> None:
         """Load windows into ``slots``: their prompts are fed from the next step on (the slot's position 0, then
-        one token per step, see _choose). Only asynchronous writes from pinned memory: the queued steps go on."""
+        one token per step, see _choose); prefilled, only the prompt's last token is (at its position; the
+        beams' slot tables point to the first row, which holds the prefilled keys/values). Only asynchronous
+        writes from pinned memory: the queued steps go on."""
         K, P, dev = self.K, self.P, self.device
 
         def to_dev(x) -> torch.Tensor:
@@ -356,14 +362,20 @@ class Search:
 
         s_idx = to_dev(slots)
         r_idx = (s_idx[:, None] * K + torch.arange(K, device=dev)).view(-1)
-        prompt = to_dev([p + [0] for p in prompts])  # [n, P + 1] (a pad: the index past the prompt)
+        fed = [p[-P:] for p in prompts]
+        prompt = to_dev([p + [0] for p in fed])  # [n, P + 1] (a pad: the index past the prompt)
         self.forced[s_idx] = prompt
         self.sot_pos[s_idx] = to_dev([p.index(self.cfg.sot) for p in prompts])
         self.tokens[r_idx, 0] = prompt[:, 0].repeat_interleave(K)
         # (index_fill_, not `x[idx] = value`: that copies the value to the GPU and waits for the queued steps)
-        self.pos.index_fill_(0, s_idx, 0)
+        if self.prefilled:
+            self.pos[s_idx] = to_dev([len(p) - 1 for p in prompts])
+            self.last_t[s_idx] = to_dev([max_new_tokens(len(p), self.max_length) - 1 for p in prompts])
+            self.src[r_idx] = self.row_ids[s_idx * K].repeat_interleave(K, 0)
+        else:
+            self.pos.index_fill_(0, s_idx, 0)
+            self.src[r_idx] = self.row_ids[r_idx]
         self.t.index_fill_(0, s_idx, -(P - 1))
-        self.src[r_idx] = self.row_ids[r_idx]
         first = torch.arange(len(r_idx), device=dev) % K == 0  # only the first beam takes part in the first step
         self.cum[r_idx] = torch.where(first | (self.mode != "beam"), 0.0, float("-inf"))
         if self.mode == "beam":
@@ -386,10 +398,14 @@ class Search:
         check_every: int = 1,
         ahead: int = 1,
         max_initial_timestamp_index: int = 50,
+        prefill: Callable[[list[int], list[list[int]]], None] | None = None,
     ) -> list[WindowResult]:
         """Decode len(prompts) windows (prompts of length P), at most B at a time: a slot whose window is done
         takes the next one. ``load(slots, windows)`` puts the windows' cross-attention keys/values into those
-        slots (on the current stream, before the next step).
+        slots (on the current stream, before the next step). Prefilled (``prompt_length=None``): prompts of any
+        length, ``prefill(slots, prompts)`` writing the keys/values of all but each prompt's last token into the
+        slot's first row of the cache (positions from 0) and the window's no-speech probability into
+        ``no_speech``, as CTranslate2 runs a prompt before its decode.
 
         The slots' done flags are copied to the host after every ``check_every`` steps and read ``ahead``
         checks later, so ``ahead * check_every`` steps stay queued while the host collects the finished windows
@@ -426,6 +442,8 @@ class Search:
             if not pairs:
                 return
             load([s for s, _ in pairs], [w for _, w in pairs])
+            if self.prefilled:
+                prefill([s for s, _ in pairs], [prompts[w] for _, w in pairs])
             self._start([s for s, _ in pairs], [prompts[w] for _, w in pairs])
             for s, w in pairs:
                 window[s] = w
@@ -434,7 +452,9 @@ class Search:
         def collect(wait: bool) -> None:
             while finished and (wait or _ready(finished[0][1][0])):
                 windows, state = finished.popleft()
-                for w, r in zip(windows, self._results(state)):
+                limits = [max_new_tokens(len(prompts[w]), self.max_length) if self.prefilled else self.max_new
+                          for w in windows]
+                for w, r in zip(windows, self._results(state, limits)):
                     results[w] = r
 
         fill(list(range(self.B)))
@@ -479,7 +499,7 @@ class Search:
         parts = [_to_host(p) for p in parts]
         return _record(dev), parts
 
-    def _results(self, state: tuple) -> list[WindowResult]:
+    def _results(self, state: tuple, max_new: list[int]) -> list[WindowResult]:
         ev, parts = state
         _wait(ev)
         K = self.K
@@ -490,13 +510,13 @@ class Search:
                 hyps = [Hypothesis(tokens[j][i][: lengths[j][i]], score[j][i], lengths[j][i])
                         for i in range(min(count[j], 2 * K))]
                 best = max(hyps, key=lambda h: h.normalized)
-                out.append(WindowResult(best, no_speech[j], hyps, self.max_new))
+                out.append(WindowResult(best, no_speech[j], hyps, max_new[j]))
             return out
         no_speech, hist, cum, length = (p.tolist() for p in parts)
         for j in range(len(no_speech)):
             hyps = [Hypothesis(hist[r][: length[r]], cum[r], length[r]) for r in range(j * K, (j + 1) * K)]
             best = max(hyps, key=lambda h: h.normalized)
-            out.append(WindowResult(best, no_speech[j], hyps, self.max_new))
+            out.append(WindowResult(best, no_speech[j], hyps, max_new[j]))
         return out
 
 

@@ -203,3 +203,48 @@ def test_fused_beam_reaches_limit():
     assert res.reached_max_length and len(res.tokens) == search.max_new
     toks, _ = ct2_beam(prompts[0].tolist(), 2, search.max_new, 0, [EOT], [])
     assert res.tokens == toks
+
+
+def fake_prefill(search, seed):
+    """What a prefill writes: the keys/values of each prompt's tokens but the last in the slot's first row (the fake
+    decoder's cache holds token ids) and the no-speech probability at <|startoftranscript|>."""
+
+    def prefill(slots, prompts):
+        for s, p in zip(slots, prompts):
+            row = s * search.K
+            for j, tok in enumerate(p[:-1]):
+                search.cache[0, :, row, 0, j, :] = float(tok)
+            sot = p.index(SOT)
+            search.no_speech[s] = scores_of(p[: sot + 1], seed).float().softmax(-1)[NOSPEECH]
+
+    return prefill
+
+
+@pytest.mark.parametrize("seed", range(4))
+@pytest.mark.parametrize("mode,K,device", [("beam", 3, "cpu"), ("greedy", 1, "cpu"), ("beam", 3, "cuda"),
+                                           ("beam", 5, "cuda")])
+def test_prefilled_prompts_match_ct2(seed, mode, K, device):
+    """Prompts of any length (previous text before <|startoftranscript|>), all but their last token prefilled:
+    CTranslate2's results, each window with its own token limit, refilled slots included."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    cfg = make_cfg()
+    suppress, begin = [5, 6, 7], [8, EOT]
+    prompts = [[4 + (w * 7 + j) % 30 for j in range(3 * w)] + [SOT, 10 + w, 20, 30] for w in range(9)]  # 4..28
+    search = Search(cfg, fake_step(seed), 3, K, None, mode, dtype=torch.float32, device=device, max_length=40,
+                    graphs=False)
+    results = search.stream(prompts, lambda slots, windows: None, suppress, begin, check_every=1, ahead=1,
+                            prefill=fake_prefill(search, seed))
+    for w, prompt in enumerate(prompts):
+        limit = min(20, 40 - (len(prompt) - 1))
+        assert results[w].max_new == limit
+        if mode == "beam":
+            toks, score = ct2_beam(prompt, K, limit, seed, suppress, begin)
+            assert results[w].tokens == toks, w
+            assert results[w].hypothesis.normalized == pytest.approx(score / len(toks), abs=1e-4)
+        else:
+            toks, score = ct2_greedy(prompt, limit, seed, suppress, begin)
+            assert results[w].tokens == toks, w
+        sot = prompt.index(SOT)
+        p0 = scores_of(prompt[: sot + 1], seed).float().softmax(-1)[NOSPEECH].item()
+        assert results[w].no_speech_prob == pytest.approx(p0, abs=1e-6)

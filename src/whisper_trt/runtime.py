@@ -102,6 +102,7 @@ class TritonDecoderBackend:
         self.dtype = torch.float16
         self.encoder = encoder
         dec = model.decoder
+        self.torch_decoder = dec  # (modeling.Decoder on these weights: word timestamps' alignment, alignment.py)
         self.embed, self.pos = dec.embed_tokens.weight, dec.embed_positions.weight
         self.final = (dec.layer_norm.weight, dec.layer_norm.bias)
         self.layers = []
@@ -122,11 +123,11 @@ class TritonDecoderBackend:
         self.encoder.encode(feats, cross, lane)
 
     def step_fn(self, tokens, offset, cache, logits, new_kv, src, cross) -> Callable[[], None]:
-        if tokens.shape[1] != 1:
-            raise ValueError("the Triton decoder runs single-token steps")
         k, attn, cfg = self.k, self.attn, self.cfg
         n, d, H, D = tokens.shape[0], cfg.d_model, cfg.dec_heads, cfg.head_dim
         w = cross.shape[2]
+        if tokens.shape[1] != 1:
+            return self._multi_token_fn(tokens, offset, cache, logits, new_kv, src, cross)
 
         step_cfg = attn.self_attn_step_config(n)
 
@@ -169,6 +170,37 @@ class TritonDecoderBackend:
         if self.gemm == "cublas":
             run = run_cublas
             run.writes_cache = True  # (the new keys/values are in the cache at offset, not in new_kv)
+        run.keep = (tokens, offset, cache, logits, new_kv, src, cross)
+        return run
+
+
+    def _multi_token_fn(self, tokens, offset, cache, logits, new_kv, src, cross) -> Callable[[], None]:
+        """S tokens a row (a prompt): the cache's slots below ``offset`` and the new tokens causally; the new
+        keys/values into ``new_kv`` [L, 2, N, H, S, d_k], logits [N, S, V] for every position."""
+        k, attn, cfg = self.k, self.attn, self.cfg
+        n, S = tokens.shape
+        d, H, D, w = cfg.d_model, cfg.dec_heads, cfg.head_dim, cross.shape[2]
+        steps = torch.arange(S, device=tokens.device)
+
+        def run() -> None:
+            x = (self.embed[tokens] + self.pos[offset[:, None] + steps]).reshape(n * S, d).contiguous()
+            for i, p in enumerate(self.layers):
+                h = k.layer_norm_bias(x, *p["ln1"], p["out"][1])
+                qkv = torch.addmm(p["qkv"][1], h, p["qkv"][0].t())  # [N * S, 3d]
+                new_kv[i].copy_(qkv.view(n, S, 3, H, D)[:, :, 1:].permute(2, 0, 3, 1, 4))
+                y = attn.self_attn_triton(qkv.view(n, S, 3 * d), cache[i, 0], cache[i, 1], offset, src)
+                x.addmm_(y.view(n * S, d), p["out"][0].t())
+                h = k.layer_norm_bias(x, *p["ln2"], p["xout"][1])
+                qw = torch.addmm(p["q"][1], h, p["q"][0].t()).view(w, n * S // w, d)
+                part = attn.cross_attn_split_triton(qw, cross[i, 0], cross[i, 1])
+                a = attn.cross_attn_combine_triton(part, qw)
+                x.addmm_(a.view(n * S, d), p["xout"][0].t())
+                h = k.layer_norm_bias(x, *p["ln3"], p["fc2"][1])
+                g = torch.nn.functional.gelu(torch.addmm(p["fc1"][1], h, p["fc1"][0].t()))
+                x.addmm_(g, p["fc2"][0].t())
+            xf = torch.nn.functional.layer_norm(x.float(), (d,), self.final[0].float(), self.final[1].float())
+            attn.logits32_triton(xf.half().view(n, S, d), self.embed, out=logits)
+
         run.keep = (tokens, offset, cache, logits, new_kv, src, cross)
         return run
 

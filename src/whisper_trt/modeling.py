@@ -254,8 +254,8 @@ class Decoder(nn.Module):
         self, tokens: torch.Tensor, cross_kv: torch.Tensor, heads: tuple[tuple[int, int], ...] = ()
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Whole sequences at once (no cache): tokens [B, S], cross_kv from :meth:`cross_kv`. Returns logits
-        [B, S, V] and, for ``heads`` ((layer, head) pairs), their cross-attention weights [B, len(heads), S, T]
-        (fp32; word timestamps)."""
+        [B, S, V] and, for ``heads`` ((layer, head) pairs), their cross-attention scores before the softmax
+        (q k^T / sqrt(d_k)) [B, len(heads), S, T] (fp32; word timestamps, alignment.py)."""
         b, s = tokens.shape
         x = self.embed_tokens(tokens) + self.embed_positions.weight[:s]
         causal = torch.ones(s, s, dtype=torch.bool, device=tokens.device).tril()
@@ -271,7 +271,7 @@ class Decoder(nn.Module):
             if mine:
                 scores = (q.float() * q.shape[-1] ** -0.5) @ cross_kv[i, 0].float().transpose(-1, -2)
                 p = scores.softmax(-1)  # [B, H, S, T]
-                weights.update({(i, hd): p[:, hd] for hd in mine})
+                weights.update({(i, hd): scores[:, hd] for hd in mine})
                 x = x + src.merge(p.to(x.dtype) @ cross_kv[i, 1])
             else:
                 x = x + src.merge(attend(q, cross_kv[i, 0], cross_kv[i, 1]))

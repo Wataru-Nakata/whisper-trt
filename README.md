@@ -36,21 +36,22 @@ passes; faster-whisper 1.2.1 (CTranslate2 4.8.2, fp16) decodes batches of 8 wind
 
 | set | faster-whisper, batch 8 | **whisper-trt, 8 slots** | **16 slots** | **32 slots** |
 |---|---:|---:|---:|---:|
-| LibriSpeech test-clean (2620 utterances, 5.4 h) | 103 | **448** (4.3x) | **552** (5.4x) | **617** (6.0x) |
-| JVS parallel100 (1000 utterances, 2.2 h) | 99 | **389** (3.9x) | **484** (4.9x) | **559** (5.6x) |
-| YODAS v3 Japanese (300 web-audio windows, 2.1 h) | 154 | **611** (4.0x) | **837** (5.4x) | **998** (6.5x) |
-| YODAS v3 English (300 windows, 1.9 h) | 215 | **906** (4.2x) | **1177** (5.5x) | **1350** (6.3x) |
-| YODAS v3 Hindi (300 windows, 2.0 h) | 106 | **384** (3.6x) | **557** (5.3x) | **675** (6.4x) |
+| LibriSpeech test-clean (2620 utterances, 5.4 h) | 103 | **460** (4.5x) | **569** (5.5x) | **633** (6.1x) |
+| JVS parallel100 (1000 utterances, 2.2 h) | 99 | **392** (4.0x) | **502** (5.1x) | **578** (5.8x) |
+| YODAS v3 Japanese (300 web-audio windows, 2.1 h) | 154 | **637** (4.1x) | **878** (5.7x) | **1050** (6.8x) |
+| YODAS v3 English (300 windows, 1.9 h) | 215 | **946** (4.4x) | **1230** (5.7x) | **1407** (6.5x) |
+| YODAS v3 Hindi (300 windows, 2.0 h) | 106 | **421** (4.0x) | **588** (5.5x) | **717** (6.8x) |
 
 Peak GPU memory 15 / 18 / 25 GiB at 8 / 16 / 32 slots. The encoder engine takes about 2 minutes to build on
-first use. 64 slots (`from_pretrained(max_batch=64, max_rows=320)`, 38-41 GiB) give another 3-4%: 649 on
-LibriSpeech, 1058 / 1422 on YODAS Japanese / English. With the TensorRT decoder engine instead (`decoder="tensorrt"`, same job): 396 / 510 / 567 on
-LibriSpeech, 517 / 752 / 871 on YODAS Japanese.
+first use. With the TensorRT decoder engine instead (`decoder="tensorrt"`, same job): 413 / 530 / 584 on
+LibriSpeech, 537 / 789 / 918 on YODAS Japanese. 64 slots (`from_pretrained(max_batch=64, max_rows=320)`,
+38-41 GiB) gave another 3-4% (before the fused beam bookkeeping: 649 on LibriSpeech, 1058 / 1422 on YODAS
+Japanese / English).
 
 Where the time goes (YODAS Japanese, `scripts/profile_stream.py`, `scripts/profile_body.py`): 98% of the wall
-time in decoder steps at 8 slots (3.4 ms each for 40 rows, with the encoder of the next windows running alongside
-on another stream; 2.9 ms alone at 80 cached positions, of which 0.33 ms beam search and bookkeeping), 93% at 32
-slots (7.2 ms each; 5.4 ms alone, 0.63 ms bookkeeping). The encoder costs 6.3 ms a window whatever
+time in decoder steps at 8 slots (with the encoder of the next windows running alongside on another stream; a
+step for 40 rows takes 2.8 ms alone at 80 cached positions, of which 0.16 ms beam search's bookkeeping), 93% at
+32 slots (5.1 ms alone, 0.37 ms bookkeeping). The encoder costs 6.3 ms a window whatever
 the batch (`scripts/bench_encoder.py`), so on short utterances, padded to 30 s windows like faster-whisper's, it
 is about half of the GPU time at 32 slots (LibriSpeech: 2620 windows, 16.5 s of the 31.5 s). The encoder and
 the decoder steps barely overlap (17% of the shorter, `scripts/overlap.py`): the decoder's ~400 small kernels

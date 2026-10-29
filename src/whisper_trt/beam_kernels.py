@@ -12,6 +12,10 @@ of ~80 small PyTorch kernels (0.3-0.6 ms a step at 8-32 windows).
   tables; a window still in its prompt is fed its next prompt token instead; the no-speech probability is kept at
   ``<|startoftranscript|>``, the slot table of each row marks its new cache slot, and windows not done advance.
   Windows already done are left as they are (their results are their finished hypotheses).
+* with sampled slots (``Search(sampling_slots=True)``): :func:`scores` leaves their rows' log-probabilities
+  without the cumulative score, :func:`sample` draws each of their rows' token (Gumbel-max on
+  ``log_probs / temperature`` with ``search.uniform``'s random numbers, as ``Search._greedy``), and
+  :func:`update` applies CTranslate2's GreedySearch rules to them.
 """
 
 import torch
@@ -19,6 +23,7 @@ import torch
 try:
     import triton
     import triton.language as tl
+    from triton.language.extra import libdevice
 except ImportError:  # (no Triton: Search keeps its PyTorch bookkeeping)
     triton = None
 
@@ -44,9 +49,9 @@ if triton is not None:
         return m
 
     @triton.jit
-    def _scores_kernel(logits, suppress, begin, t, cum, out, ns, hist, max_initial, V, NO_SPEECH, NOTS, TSB, EOT,
-                       K: tl.constexpr, T: tl.constexpr, TS: tl.constexpr, LOW: tl.constexpr, BV: tl.constexpr,
-                       TB: tl.constexpr):  # fmt: skip
+    def _scores_kernel(logits, suppress, begin, t, cum, out, ns, hist, max_initial, sampling, V, NO_SPEECH, NOTS,
+                       TSB, EOT, K: tl.constexpr, T: tl.constexpr, TS: tl.constexpr, LOW: tl.constexpr,
+                       BV: tl.constexpr, TB: tl.constexpr, MIXED: tl.constexpr):  # fmt: skip
         r = tl.program_id(0)
         b = r // K
         tw = tl.load(t + b)
@@ -106,6 +111,8 @@ if triton is not None:
             m_msk = tl.where(text_out, m_ts, m_msk)
             log_sum = tl.where(text_out, tl.log(s_ts), log_sum)
         c = tl.load(cum + r)
+        if MIXED:  # a sampled row: its log-probabilities alone
+            c = tl.where(tl.load(sampling + b) != 0, 0.0, c)
         for v0 in range(0, V, BV):
             v = v0 + tl.arange(0, BV)
             ok = v < V
@@ -119,10 +126,51 @@ if triton is not None:
             tl.store(ns + b, tl.exp(tl.load(logits + base + NO_SPEECH) - (m_raw + tl.log(s_raw))))
 
     @triton.jit
+    def _uniform(x):
+        """search.uniform's hash of the counters ``x`` (int64, already with the seed and step)."""
+        m = tl.full([], 0xFFFFFFFF, tl.int64)
+        x = x & m
+        for _ in tl.static_range(2):
+            x = (x * tl.full([], 747796405, tl.int64) + tl.full([], 2891336453, tl.int64)) & m
+            x = (((x >> ((x >> 28) + 4)) ^ x) * tl.full([], 277803737, tl.int64)) & m
+            x = ((x >> 22) ^ x) & m
+        return (x.to(tl.float32) + 0.5) * (1.0 / 4294967296.0)  # (exact: as the division by 2**32)
+
+    @triton.jit
+    def _sample_kernel(scores, t, done, row_done, sampling, temperature, seed, samp_tok, samp_score, V,
+                       K: tl.constexpr, BV: tl.constexpr):  # fmt: skip
+        r = tl.program_id(0)
+        b = r // K
+        tw = tl.load(t + b)
+        go = (tl.load(sampling + b) != 0) & (tl.load(done + b) == 0) & (tw >= 0) & (tl.load(row_done + r) == 0)
+        if go:
+            temp = tl.load(temperature + b)
+            base = r.to(tl.int64) * V
+            # the counters but the token's (search.uniform): seed, step, row within the window
+            mix = tl.load(seed + b) * tl.full([], 0x6C8E9CF5, tl.int64)
+            mix += tw.to(tl.int64) * tl.full([], 0x85EBCA77, tl.int64) + (r % K).to(tl.int64) * V
+            best = tl.full([], float("-inf"), tl.float32)
+            best_i = tl.zeros([], tl.int64)
+            for v0 in range(0, V, BV):
+                v = v0 + tl.arange(0, BV)
+                ok = v < V
+                x = tl.load(scores + base + v, mask=ok, other=float("-inf"))
+                u = tl.maximum(_uniform(mix + v.to(tl.int64)), 1e-20)
+                g = tl.math.div_rn(x, temp) - libdevice.log(-libdevice.log(u))
+                g = tl.where(ok, g, float("-inf"))
+                m = tl.max(g, 0)
+                i = tl.argmax(g, 0).to(tl.int64)
+                take = m > best  # (the first of equal maxima, as torch.argmax)
+                best_i = tl.where(take, v0 + i, best_i)
+                best = tl.where(take, m, best)
+            tl.store(samp_tok + r, best_i)
+            tl.store(samp_score + r, tl.load(scores + base + best_i))
+
+    @triton.jit
     def _update_kernel(top_s, top_i, t, pos, sot_pos, ns, no_speech, done, hist, cum, src, tokens, forced,
-                       h_count, h_score, h_len, h_tokens, last_t, V, EOT, P, K: tl.constexpr, T: tl.constexpr,
-                       C: tl.constexpr, S: tl.constexpr, KB: tl.constexpr, TB: tl.constexpr,
-                       CB: tl.constexpr):  # fmt: skip
+                       h_count, h_score, h_len, h_tokens, last_t, sampling, samp_tok, samp_score, row_done, length, V,
+                       EOT, P, K: tl.constexpr, T: tl.constexpr, C: tl.constexpr, S: tl.constexpr, KB: tl.constexpr,
+                       TB: tl.constexpr, CB: tl.constexpr, MIXED: tl.constexpr):  # fmt: skip
         b = tl.program_id(0)
         j = tl.arange(0, KB)
         jm = j < K
@@ -143,55 +191,82 @@ if triton is not None:
             tl.store(pos + b, pb + 1)
             tl.store(t + b, tb + 1)
         elif db == 0:
-            cand = b * 2 * K + j
-            p_i = tl.load(top_i + cand, mask=jm, other=0)
-            p_s = tl.load(top_s + cand, mask=jm, other=float("-inf"))
-            s_i = tl.load(top_i + cand + K, mask=jm, other=0)
-            s_s = tl.load(top_s + cand + K, mask=jm, other=float("-inf"))
-            tok, par = p_i % V, p_i // V
-            s_tok, s_par = s_i % V, s_i // V
-            eos = (tok == EOT) & jm
-            last = tb == tl.load(last_t + b)
-            finish = (eos | last) & jm
-            slot = tl.load(h_count + b) + tl.cumsum(finish.to(tl.int64), 0) - 1
-            # each ended candidate's place: the r-th secondary candidate that does not end
-            sec_ok = (s_tok != EOT) & jm
-            sec_rank = tl.cumsum(sec_ok.to(tl.int32), 0) - 1
-            r = tl.cumsum(eos.to(tl.int32), 0) - 1
-            take = eos & (r < tl.sum(sec_ok.to(tl.int32), 0))
-            match = sec_ok[None, :] & (sec_rank[None, :] == r[:, None])  # [beam, secondary]
-            new_tok = tl.where(take, tl.sum(tl.where(match, s_tok[None, :], 0), 1), tok)
-            new_par = tl.where(take, tl.sum(tl.where(match, s_par[None, :], 0), 1), par)
-            new_s = tl.where(take, tl.sum(tl.where(match, s_s[None, :], 0.0), 1), p_s)
-            # every read of the window's state before any write (beams take other beams' rows)
-            tt = tl.arange(0, TB)
-            tm = jm[:, None] & (tt < T)[None, :]
-            par_hist = tl.load(hist + (b * K + par).to(tl.int64)[:, None] * T + tt[None, :], mask=tm, other=0)
-            new_hist = tl.load(hist + (b * K + new_par).to(tl.int64)[:, None] * T + tt[None, :], mask=tm, other=0)
-            src_par = src + (b * K + new_par).to(tl.int64)[:, None] * C + cc[None, :]
-            new_src = tl.load(src_par, mask=cm, other=0)
-            new_src = tl.where(cc[None, :] == pb, (b * K + new_par).to(tl.int32)[:, None], new_src)
-            tl.debug_barrier()
-            # finished hypotheses (EOS not part of them; at the last step the token is)
-            with_tok = ~eos
-            h_row = tl.where(with_tok[:, None] & (tt[None, :] == tb), tok[:, None], par_hist)
-            hm = finish[:, None] & (tt < T)[None, :]
-            tl.store(h_tokens + (b * S + slot)[:, None] * T + tt[None, :], h_row, mask=hm)
-            tl.store(h_score + b * S + slot, p_s, mask=finish)
-            tl.store(h_len + b * S + slot, tb + with_tok.to(tl.int64), mask=finish)
-            count = tl.load(h_count + b) + tl.sum(finish.to(tl.int64), 0)
-            tl.store(h_count + b, count)
-            # the new beams
-            tl.store(hist + rows.to(tl.int64)[:, None] * T + tt[None, :],
-                     tl.where(tt[None, :] == tb, new_tok[:, None], new_hist), mask=tm)
-            tl.store(cum + rows, new_s, mask=jm)
-            tl.store(tokens + rows, new_tok, mask=jm)
-            tl.store(src_rows, new_src, mask=cm)
-            ended = (count >= K) | last
-            tl.store(done + b, ended)
-            if not ended:
-                tl.store(pos + b, pb + 1)
-                tl.store(t + b, tb + 1)
+            samp = False
+            if MIXED:
+                samp = tl.load(sampling + b) != 0
+            if samp:  # a sampled window: GreedySearch's rules
+                tok = tl.load(samp_tok + rows, mask=jm, other=0)
+                sc = tl.load(samp_score + rows, mask=jm, other=0.0)
+                rd = (tl.load(row_done + rows, mask=jm, other=1) != 0) | ~jm
+                live = ~rd
+                c0 = tl.load(cum + rows, mask=jm, other=0.0)
+                tl.store(cum + rows, tl.where(live, c0 + sc, c0), mask=jm)
+                eos = tok == EOT
+                last = tb == tl.load(last_t + b)
+                keep = live & ~eos  # a generated token (EOS is not part of the hypothesis)
+                h_ptr = hist + rows.to(tl.int64) * T + tb
+                tl.store(h_ptr, tl.where(keep, tok, tl.load(h_ptr, mask=jm, other=0)), mask=jm)
+                tl.store(length + rows, tl.load(length + rows, mask=jm, other=0) + keep.to(tl.int64), mask=jm)
+                rd = rd | eos | last
+                tl.store(row_done + rows, rd, mask=jm)
+                tl.store(tokens + rows, tok, mask=jm)
+                marked = tl.where(cc[None, :] == pb, rows.to(tl.int32)[:, None], tl.load(src_rows, mask=cm, other=0))
+                tl.store(src_rows, marked, mask=cm)
+                ended = tl.min(rd.to(tl.int32), 0) != 0
+                tl.store(done + b, ended)
+                if not ended:
+                    tl.store(pos + b, pb + 1)
+                    tl.store(t + b, tb + 1)
+            else:
+                cand = b * 2 * K + j
+                p_i = tl.load(top_i + cand, mask=jm, other=0)
+                p_s = tl.load(top_s + cand, mask=jm, other=float("-inf"))
+                s_i = tl.load(top_i + cand + K, mask=jm, other=0)
+                s_s = tl.load(top_s + cand + K, mask=jm, other=float("-inf"))
+                tok, par = p_i % V, p_i // V
+                s_tok, s_par = s_i % V, s_i // V
+                eos = (tok == EOT) & jm
+                last = tb == tl.load(last_t + b)
+                finish = (eos | last) & jm
+                slot = tl.load(h_count + b) + tl.cumsum(finish.to(tl.int64), 0) - 1
+                # each ended candidate's place: the r-th secondary candidate that does not end
+                sec_ok = (s_tok != EOT) & jm
+                sec_rank = tl.cumsum(sec_ok.to(tl.int32), 0) - 1
+                r = tl.cumsum(eos.to(tl.int32), 0) - 1
+                take = eos & (r < tl.sum(sec_ok.to(tl.int32), 0))
+                match = sec_ok[None, :] & (sec_rank[None, :] == r[:, None])  # [beam, secondary]
+                new_tok = tl.where(take, tl.sum(tl.where(match, s_tok[None, :], 0), 1), tok)
+                new_par = tl.where(take, tl.sum(tl.where(match, s_par[None, :], 0), 1), par)
+                new_s = tl.where(take, tl.sum(tl.where(match, s_s[None, :], 0.0), 1), p_s)
+                # every read of the window's state before any write (beams take other beams' rows)
+                tt = tl.arange(0, TB)
+                tm = jm[:, None] & (tt < T)[None, :]
+                par_hist = tl.load(hist + (b * K + par).to(tl.int64)[:, None] * T + tt[None, :], mask=tm, other=0)
+                new_hist = tl.load(hist + (b * K + new_par).to(tl.int64)[:, None] * T + tt[None, :], mask=tm, other=0)
+                src_par = src + (b * K + new_par).to(tl.int64)[:, None] * C + cc[None, :]
+                new_src = tl.load(src_par, mask=cm, other=0)
+                new_src = tl.where(cc[None, :] == pb, (b * K + new_par).to(tl.int32)[:, None], new_src)
+                tl.debug_barrier()
+                # finished hypotheses (EOS not part of them; at the last step the token is)
+                with_tok = ~eos
+                h_row = tl.where(with_tok[:, None] & (tt[None, :] == tb), tok[:, None], par_hist)
+                hm = finish[:, None] & (tt < T)[None, :]
+                tl.store(h_tokens + (b * S + slot)[:, None] * T + tt[None, :], h_row, mask=hm)
+                tl.store(h_score + b * S + slot, p_s, mask=finish)
+                tl.store(h_len + b * S + slot, tb + with_tok.to(tl.int64), mask=finish)
+                count = tl.load(h_count + b) + tl.sum(finish.to(tl.int64), 0)
+                tl.store(h_count + b, count)
+                # the new beams
+                tl.store(hist + rows.to(tl.int64)[:, None] * T + tt[None, :],
+                         tl.where(tt[None, :] == tb, new_tok[:, None], new_hist), mask=tm)
+                tl.store(cum + rows, new_s, mask=jm)
+                tl.store(tokens + rows, new_tok, mask=jm)
+                tl.store(src_rows, new_src, mask=cm)
+                ended = (count >= K) | last
+                tl.store(done + b, ended)
+                if not ended:
+                    tl.store(pos + b, pb + 1)
+                    tl.store(t + b, tb + 1)
 
 
 def scores(s, logits: torch.Tensor, out: torch.Tensor, ns: torch.Tensor) -> None:
@@ -201,17 +276,27 @@ def scores(s, logits: torch.Tensor, out: torch.Tensor, ns: torch.Tensor) -> None
     n, v = logits.shape
     c = s.cfg
     T = s.hist.shape[1]
-    _scores_kernel[(n,)](logits, s.suppress, s.begin, s.t, s.cum, out, ns, s.hist, s.max_initial, v, c.no_speech,
-                         c.no_timestamps, c.timestamp_begin or 0, c.eot, K=s.K, T=T, TS=s.timestamps, LOW=LOWEST,
-                         BV=BLOCK_V, TB=triton.next_power_of_2(T), num_warps=8)
+    _scores_kernel[(n,)](logits, s.suppress, s.begin, s.t, s.cum, out, ns, s.hist, s.max_initial, s.sampling, v,
+                         c.no_speech, c.no_timestamps, c.timestamp_begin or 0, c.eot, K=s.K, T=T, TS=s.timestamps,
+                         LOW=LOWEST, BV=BLOCK_V, TB=triton.next_power_of_2(T), MIXED=s.mixed, num_warps=8)
+
+
+def sample(s) -> None:
+    """Each sampled row's token and its log-probability (``s.samp_tok``, ``s.samp_score``) from :func:`scores`'
+    output (``s.scores``)."""
+    n, v = s.scores.shape
+    _sample_kernel[(n,)](s.scores, s.t, s.done, s.row_done, s.sampling, s.temperature, s.seed, s.samp_tok,
+                         s.samp_score, v, K=s.K, BV=BLOCK_V, num_warps=8)
 
 
 def update(s, top_s: torch.Tensor, top_i: torch.Tensor, ns: torch.Tensor) -> None:
     """The step's bookkeeping on ``s`` (a search.Search in beam mode) from the best 2K candidates."""
     T, C = s.hist.shape[1], s.src.shape[1]
+    mixed = {"samp_tok": s.samp_tok, "samp_score": s.samp_score} if s.mixed else {}
     _update_kernel[(s.B,)](
         top_s, top_i, s.t, s.pos, s.sot_pos, ns, s.no_speech, s.done, s.hist, s.cum, s.src, s.tokens, s.forced,
-        s.h_count, s.h_score, s.h_len, s.h_tokens, s.last_t, s.cfg.vocab_size, s.cfg.eot, s.P, K=s.K, T=T, C=C,
+        s.h_count, s.h_score, s.h_len, s.h_tokens, s.last_t, s.sampling, mixed.get("samp_tok", top_i),
+        mixed.get("samp_score", top_s), s.row_done, s.length, s.cfg.vocab_size, s.cfg.eot, s.P, K=s.K, T=T, C=C,
         S=s.h_score.shape[1], KB=triton.next_power_of_2(s.K), TB=triton.next_power_of_2(T),
-        CB=triton.next_power_of_2(C), num_warps=4,
+        CB=triton.next_power_of_2(C), MIXED=s.mixed, num_warps=4,
     )  # fmt: skip

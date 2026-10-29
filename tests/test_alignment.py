@@ -1,11 +1,11 @@
-"""alignment: the dynamic time warping and median filter against line-by-line transcriptions of CTranslate2
-4.8.2's (dtw.cc, ops/median_filter_cpu.cc), ties included."""
+"""alignment: the dynamic time warping (on the host, and in a Triton kernel) and median filter against line-by-line
+transcriptions of CTranslate2 4.8.2's (dtw.cc, ops/median_filter_cpu.cc), ties included."""
 
 import numpy as np
 import pytest
 import torch
 
-from whisper_trt.alignment import median_filter, negative_dtw
+from whisper_trt.alignment import dtw_first_frames, first_frames, median_filter, negative_dtw, triton
 
 
 def ct2_negative_dtw(x: np.ndarray) -> list[tuple[int, int]]:
@@ -75,3 +75,17 @@ def test_median_filter_matches_ctranslate2(depth):
     for a in range(2):
         for b in range(3):
             assert got[a, b].tolist() == pytest.approx(ct2_median(x[a, b].tolist(), 7))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or triton is None, reason="needs CUDA and Triton")
+@pytest.mark.parametrize("seed", range(12))
+def test_dtw_kernel_first_frames_match_ctranslate2(seed):
+    """The time warping in one Triton kernel: each row's first column on CTranslate2's path, ties included."""
+    rng = np.random.default_rng(100 + seed)
+    n, m = int(rng.integers(1, 230)), int(rng.integers(1, 1500))
+    if seed < 4:
+        n, m = int(rng.integers(1, 6)), int(rng.integers(1, 12))
+    x = (rng.integers(-2, 3, size=(n, m)) if seed % 2 else rng.normal(size=(n, m))).astype(np.float32)
+    got = dtw_first_frames(torch.from_numpy(x).cuda()).cpu().numpy()
+    want = first_frames(ct2_negative_dtw(x) if n * m < 5000 else negative_dtw(x), n)
+    assert got.tolist() == want.tolist()

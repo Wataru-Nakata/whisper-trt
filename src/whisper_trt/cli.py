@@ -24,7 +24,7 @@ def main(argv: list[str] | None = None) -> None:
     for p in (t, d):
         p.add_argument("audio", nargs="+")
         p.add_argument("--batch-size", type=int, default=8)
-    t.add_argument("--language", required=True)
+    t.add_argument("--language", help="the language (required but with --long: detected per recording)")
     t.add_argument("--task", default="transcribe", choices=("transcribe", "translate"))
     t.add_argument("--beam-size", type=int, default=5)
     t.add_argument("--json", action="store_true", help="every value per recording, as JSON lines")
@@ -35,6 +35,8 @@ def main(argv: list[str] | None = None) -> None:
     args = ap.parse_args(argv)
     if args.cmd == "transcribe" and args.word_timestamps and not args.long:
         ap.error("--word-timestamps needs --long")
+    if args.cmd == "transcribe" and not args.long and not args.language:
+        ap.error("--language is required (without --long)")
 
     from . import Whisper
 
@@ -47,9 +49,12 @@ def main(argv: list[str] | None = None) -> None:
                                batch_size=args.batch_size, word_timestamps=args.word_timestamps)
         for path, segments in zip(args.audio, out):
             if args.json:
-                print(json.dumps({"audio": path, "segments": [dataclasses.asdict(s) for s in segments]},
-                                 ensure_ascii=False))
+                print(json.dumps({"audio": path, "language": segments.language,
+                                  "language_probability": segments.language_probability,
+                                  "segments": [dataclasses.asdict(s) for s in segments]}, ensure_ascii=False))
                 continue
+            if not args.language:
+                print(f"{path}\tlanguage {segments.language} ({segments.language_probability:.2f})")
             for s in segments:
                 print(f"{path}\t[{s.start:.2f} -> {s.end:.2f}]\t{s.text.strip()}")
                 for w in s.words or []:

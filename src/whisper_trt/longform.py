@@ -6,19 +6,26 @@ window from a seek position: a 30 s window of features from the seek, its prompt
 (``condition_on_previous_text``; reset after a decode at a temperature above ``prompt_reset_on_temperature``),
 decoded with the temperature fallback; a window judged silent is skipped; its tokens split into segments by
 their timestamps, the next window starting at the last timestamp (or after the window); with word timestamps,
-each segment's words, the next window starting at the last word's end. A window depends on the one before it
-in its recording, so each round decodes the next window of every recording not done together
-(Whisper._fallback: refilled slots, prompts of any length prefilled).
+each segment's words, the next window starting at the last word's end. Without a language, each recording's is
+detected from its first 30 s (faster-whisper's ``detect_language``).
+
+A window depends on the one before it in its recording, so the windows stream through one search
+(Search.serve): a recording's next window, or a window's retry at the next temperature (sampled, in the same
+steps as the windows decoded by beam search), is given to the search as soon as the result before it is back.
+A window's keys/values are kept (a pool of buffers) for its retries and its word alignment, which runs on a
+stream of its own (alignment.Aligner) while the search goes on.
 """
 
+from collections import deque
 from dataclasses import dataclass
 
 import torch
 
-from .alignment import add_word_timestamps, align, find_alignment
+from .alignment import Aligner, add_word_timestamps, align, find_alignment
 from .audio import load_audio
 from .config import HOP_LENGTH, N_FRAMES, SAMPLE_RATE, TIME_PRECISION
 from .features import log_mel
+from .search import Job, mix_seed
 from .segments import split_by_timestamps
 
 FRAMES_PER_SECOND = SAMPLE_RATE // HOP_LENGTH  # feature frames
@@ -49,23 +56,52 @@ class Segment:
     temperature: float
 
 
+class Transcript(list):
+    """A recording's segments (a list of :class:`Segment`), with its language: the one given, or the one detected
+    (``language_probability``, ``all_language_probs`` as faster-whisper's ``TranscriptionInfo``)."""
+
+    def __init__(self, segments=(), language: str | None = None, language_probability: float = 1.0,
+                 all_language_probs: list[tuple[str, float]] | None = None):
+        super().__init__(segments)
+        self.language = language
+        self.language_probability = language_probability
+        self.all_language_probs = all_language_probs
+
+
 class _Recording:
-    def __init__(self, features: torch.Tensor, initial_tokens: list[int]):
-        self.features = features  # [n_mels, content frames], normalized over the whole recording
-        self.content_frames = features.shape[-1]
+    def __init__(self, index: int, features: torch.Tensor, initial_tokens: list[int]):
+        self.index = index
+        self.features = features  # [n_mels, frames + 1], normalized over the whole recording
+        self.content_frames = features.shape[-1] - 1  # (faster-whisper's: the last frame is not decoded)
         self.seek = 0
         self.all_tokens = list(initial_tokens)
         self.reset_since = 0
         self.last_speech = 0.0
+        self.windows = 0  # windows decoded so far (their random numbers' seeds)
         self.segments: list[Segment] = []
+        self.language: str | None = None
+        self.language_probability = 1.0
+        self.all_language_probs = None
+        self.sot_sequence: list[int] = []
+
+
+class _Window:
+    def __init__(self, rec: _Recording, features: torch.Tensor, size: int, prompt: list[int]):
+        self.rec, self.features, self.size, self.prompt = rec, features, size, prompt
+        self.seek = rec.seek
+        self.ordinal = rec.windows
+        rec.windows += 1
+        self.ti = 0  # the temperature being decoded
+        self.attempts: list[dict] = []
+        self.buffer: int | None = None  # its keys/values in the pool, if kept
 
 
 def recording_features(model, audio) -> torch.Tensor:
-    """faster-whisper's ``feature_extractor(audio)`` without its last frame: [n_mels, len // 160] over the whole
-    recording (normalized once)."""
+    """faster-whisper's ``feature_extractor(audio)``: [n_mels, len // 160 + 1] over the whole recording
+    (normalized once; the last frame only counts for the language detection)."""
     wave = audio if isinstance(audio, torch.Tensor) and audio.dim() == 1 else load_audio(audio)
-    frames = wave.shape[-1] // HOP_LENGTH
-    return log_mel([wave], model.cfg.n_mels, model.device, max(frames, 1))[0, :, :frames]
+    frames = wave.shape[-1] // HOP_LENGTH + 1
+    return log_mel([wave], model.cfg.n_mels, model.device, frames)[0]
 
 
 def get_end(segments: list[dict]) -> float | None:
@@ -74,110 +110,318 @@ def get_end(segments: list[dict]) -> float | None:
                 segments[-1]["end"] if segments else None)
 
 
-def transcribe(model, audio: list, language: str, task: str = "transcribe", beam_size: int = 5, best_of: int = 5,
-               temperatures: tuple[float, ...] = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
+def detect_languages(model, recs: list[_Recording], segments: int = 1, threshold: float | None = 0.5) -> None:
+    """faster-whisper's ``detect_language`` on each recording's features: its first 30 s windows (up to
+    ``segments``) one by one, the first whose top language is likelier than ``threshold``, else the most frequent
+    top language (its best probability)."""
+    c = model.cfg
+    for rec in recs:
+        votes: dict[str, list[float]] = {}
+        feats = rec.features[:, : segments * N_FRAMES]
+        for i in range(0, max(feats.shape[-1], 1), N_FRAMES):
+            window = torch.zeros(c.n_mels, N_FRAMES, device=model.device)
+            part = feats[:, i : i + N_FRAMES]
+            window[:, : part.shape[-1]] = part
+            probs = model.detect_language(model.encode(window[None]))[0]
+            language, p = probs[0]
+            rec.all_language_probs = probs
+            if threshold is not None and p > threshold:
+                break
+            votes.setdefault(language, []).append(p)
+        else:
+            language = max(votes, key=lambda k: len(votes[k]))
+            p = max(votes[language])
+        rec.language, rec.language_probability = language, p
+
+
+def transcribe(model, audio: list, language: str | None = None, task: str = "transcribe", beam_size: int = 5,
+               best_of: int = 5, temperatures: tuple[float, ...] = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
                compression_ratio_threshold: float | None = 2.4, log_prob_threshold: float | None = -1.0,
                no_speech_threshold: float | None = 0.6, condition_on_previous_text: bool = True,
                prompt_reset_on_temperature: float = 0.5, initial_prompt: str | list[int] | None = None,
                suppress_blank: bool = True, suppress_tokens: tuple[int, ...] | None = (-1,),
                without_timestamps: bool = False, max_initial_timestamp: float = 1.0, word_timestamps: bool = False,
                prepend_punctuations: str = "\"'“¿([{-", append_punctuations: str = "\"'.。,，!！?？:：”)]}、",
-               hallucination_silence_threshold: float | None = None, batch_size: int = 8,
-               seed: int = 0) -> list[list[Segment]]:
+               hallucination_silence_threshold: float | None = None, language_detection_threshold: float | None = 0.5,
+               language_detection_segments: int = 1, batch_size: int = 8, kv_pool: int | None = None,
+               seed: int = 0) -> list[Transcript]:
+    if isinstance(temperatures, (int, float)):
+        temperatures = (float(temperatures),)
+    if 1 < beam_size < best_of and any(t > 0 for t in temperatures):
+        raise NotImplementedError("best_of > beam_size > 1: the sampled windows decode in the beam search's rows")
     tok, c = model.tokenizer, model.cfg
     if isinstance(initial_prompt, str):
         initial = tok.encode(" " + initial_prompt.strip())
     else:
         initial = list(initial_prompt or [])
-    recs = [_Recording(recording_features(model, a), initial) for a in audio]
-    max_initial = int(round(max_initial_timestamp / TIME_PRECISION))
-    sot_sequence = tok.sot_sequence(language, task)
-    decoder = model._torch_decoder() if word_timestamps else None
-    rnd = 0
-    while True:
-        work = [r for r in recs if r.seek < r.content_frames]
-        if not work:
-            break
-        windows = []
-        for r in work:
-            size = min(N_FRAMES, r.content_frames - r.seek)
-            feats = torch.zeros(c.n_mels, N_FRAMES, device=model.device)
-            feats[:, :size] = r.features[:, r.seek : r.seek + size]
-            prompt = model.prompt(language, task, without_timestamps, previous_tokens=r.all_tokens[r.reset_since :])
-            windows.append((r, feats, prompt, size))
-        results = model._fallback([w[1] for w in windows], [w[2] for w in windows], beam_size, best_of,
-                                  temperatures, compression_ratio_threshold, log_prob_threshold, no_speech_threshold,
-                                  suppress_tokens, suppress_blank, batch_size, seed + rnd * len(temperatures),
-                                  max_initial)
-        rnd += 1
-        kept = []
-        for (r, feats, _, size), d in zip(windows, results):
-            if no_speech_threshold is not None:  # no voice activity: on to the next window
-                skip = d.no_speech_prob > no_speech_threshold
-                if log_prob_threshold is not None and d.avg_logprob > log_prob_threshold:
-                    skip = False
-                if skip:
-                    r.seek += size
-                    continue
-            time_offset = r.seek * TIME_PER_FRAME
-            split = split_by_timestamps(d.tokens, c.timestamp_begin, time_offset, size, size * TIME_PER_FRAME, r.seek)
-            kept.append((r, feats, size, d, time_offset, split))
-        if word_timestamps:  # the alignment of each window's segments' text tokens (its encoder output once more)
-            jobs = [(feats, [t for seg in split[0] for t in seg["tokens"] if t < tok.eot], size)
-                    for _, feats, size, _, _, split in kept]
-            alignments = _align(model, decoder, sot_sequence, language, jobs, batch_size)
-        for k, (r, _, size, d, time_offset, (current, seek, single_timestamp_ending)) in enumerate(kept):
-            window_end_time = float((r.seek + N_FRAMES) * TIME_PER_FRAME)
-            duration = size * TIME_PER_FRAME
-            previous_seek = r.seek
-            if word_timestamps:
-                r.last_speech = add_word_timestamps(current, tok, language, alignments[k], prepend_punctuations,
-                                                    append_punctuations, r.last_speech)
-                if not single_timestamp_ending:
-                    last_word_end = get_end(current)
-                    if last_word_end is not None and last_word_end > time_offset:
-                        seek = round(last_word_end * FRAMES_PER_SECOND)
-                if hallucination_silence_threshold is not None:
-                    seek, current, skipped = _skip_hallucinations(current, seek, previous_seek, time_offset,
-                                                                  duration, window_end_time, r,
-                                                                  hallucination_silence_threshold)
-                    if skipped:
-                        r.seek = seek
-                        continue
+    recs = [_Recording(i, recording_features(model, a), initial) for i, a in enumerate(audio)]
+    if language is None and c.multilingual:
+        detect_languages(model, recs, language_detection_segments, language_detection_threshold)
+    else:
+        for rec in recs:
+            rec.language = language if c.multilingual else "en"
+    for rec in recs:
+        rec.sot_sequence = tok.sot_sequence(rec.language, task)
+    if recs:
+        _Streamer(model, recs, task, beam_size, best_of, tuple(temperatures), compression_ratio_threshold,
+                  log_prob_threshold, no_speech_threshold, condition_on_previous_text, prompt_reset_on_temperature,
+                  suppress_blank, suppress_tokens, without_timestamps, int(round(max_initial_timestamp / TIME_PRECISION)),
+                  word_timestamps, prepend_punctuations, append_punctuations, hallucination_silence_threshold,
+                  batch_size, kv_pool, seed).run()
+    return [Transcript(r.segments, r.language, r.language_probability, r.all_language_probs) for r in recs]
+
+
+class _Streamer:
+    """Search.serve's source for long-form transcription: each recording's windows, one after another."""
+
+    def __init__(self, model, recs, task, beam_size, best_of, temperatures, cr_threshold, lp_threshold,
+                 ns_threshold, condition_on_previous_text, prompt_reset_on_temperature, suppress_blank,
+                 suppress_tokens, without_timestamps, max_initial, word_timestamps, prepend_punctuations,
+                 append_punctuations, hallucination_silence_threshold, batch_size, kv_pool, seed):
+        from .pipeline import compression_ratio
+
+        self.compression_ratio = compression_ratio
+        self.model, self.recs, self.task = model, recs, task
+        self.temperatures, self.best_of = temperatures, best_of
+        self.thresholds = (cr_threshold, lp_threshold, ns_threshold)
+        self.condition_on_previous_text = condition_on_previous_text
+        self.prompt_reset_on_temperature = prompt_reset_on_temperature
+        self.without_timestamps, self.max_initial = without_timestamps, max_initial
+        self.word_timestamps = word_timestamps
+        self.punctuations = (prepend_punctuations, append_punctuations)
+        self.hallucination_silence_threshold = hallucination_silence_threshold
+        self.seed = seed
+        c = model.cfg
+        dev, dtype = model.device, model.backend.dtype
+        slots = min(batch_size, len(recs))
+        if slots > model.max_batch:
+            raise ValueError(f"at most {model.max_batch} windows at a time")
+        if beam_size > 1:
+            mode, rows = "beam", beam_size
+        else:
+            mode, rows = "greedy", max(1, best_of) if any(t > 0 for t in temperatures) else 1
+        self.search = model._search(mode, slots, rows, None, not without_timestamps, mixed=True)
+        self.cross = model.cross(slots)
+        self.suppress = list(model.tokenizer.suppressed_tokens(suppress_tokens))
+        self.begin = list(c.begin_suppress_tokens) if suppress_blank else []
+        shape = (c.dec_layers, 2, 1, c.dec_heads, c.enc_frames, c.head_dim)
+        # the pool of kept keys/values: a window holds a buffer from its first load until it is settled
+        size = min(len(recs), slots + 8) if kv_pool is None else kv_pool
+        self.pool = [torch.empty(shape, dtype=dtype, device=dev) for _ in range(size)]
+        self.pool_free = list(range(size))
+        self.pool_ready: list = [None] * size  # event after the buffer's encode
+        self.pool_reads: list[list] = [[] for _ in range(size)]  # events after its reads (before a rewrite)
+        self.scratch = torch.empty(shape, dtype=dtype, device=dev)  # (windows not kept)
+        self.ready: deque[Job] = deque()
+        self.aligning: deque = deque()  # (window, decode, split, alignment handle or result)
+        self.aligner = None
+        if word_timestamps:
+            decoder = model._torch_decoder()
+            if dev.type == "cuda" and _triton_ok():
+                self.aligner = model._aligner(decoder)
+            else:
+                self.decoder = decoder
+        self.side_scratch = torch.empty(shape, dtype=dtype, device=dev) if word_timestamps else None
+
+    def run(self) -> None:
+        for rec in self.recs:
+            self._next_window(rec)
+        self.search.serve(self, self.suppress, self.begin, max_initial_timestamp_index=self.max_initial,
+                          prefill=self.model._prefill(self.search, self.cross))
+
+    # --- Search.serve's source ---------------------------------------------------------------------------
+    def take(self, n: int, block: bool = False) -> list[Job]:
+        self._poll(wait=False)
+        while block and not self.ready and self.aligning:
+            self._poll(wait=True, one=True)
+        out = []
+        while self.ready and len(out) < n:
+            out.append(self.ready.popleft())
+        return out
+
+    def load(self, slots: list[int], jobs: list[Job]) -> None:
+        stream = torch.cuda.current_stream()
+        for s, job in zip(slots, jobs):
+            win = job.key
+            if win.buffer is None and self.pool_free:  # kept from now on, for its retries and alignment
+                b = win.buffer = self.pool_free.pop(0)
+                for ev in self.pool_reads[b]:
+                    stream.wait_event(ev)
+                self.pool_reads[b] = []
+                self.model.backend.encode(win.features[None], self.pool[b])
+                self.pool_ready[b] = _event(stream)
+                src = self.pool[b]
+            elif win.buffer is not None:
+                src = self.pool[win.buffer]
+            else:
+                self.model.backend.encode(win.features[None], self.scratch)
+                src = self.scratch
+            self.cross[:, :, s].copy_(src[:, :, 0])
+            if win.buffer is not None:
+                self.pool_reads[win.buffer].append(_event(stream))
+
+    def result(self, job: Job, r) -> None:
+        from .pipeline import _needs_fallback
+
+        win = job.key
+        text = self.model.tokenizer.decode(r.tokens).strip()
+        d = {"text": text, "tokens": r.tokens, "avg_logprob": r.hypothesis.avg_logprob,
+             "no_speech_prob": r.no_speech_prob, "compression_ratio": self.compression_ratio(text),
+             "temperature": self.temperatures[win.ti], "reached_max_length": r.reached_max_length}
+        win.attempts.append(d)
+        cr, lp, ns = self.thresholds
+        if not _needs_fallback(d, cr, lp, ns):
+            self._settle(win, d)
+        elif win.ti + 1 < len(self.temperatures):  # the next temperature, before any other window
+            win.ti += 1
+            self.ready.appendleft(self._job(win))
+        else:  # every temperature failed: the best below the compression threshold, else any
+            ok = [a for a in win.attempts if cr is None or a["compression_ratio"] <= cr]
+            best = max(ok or win.attempts, key=lambda a: a["avg_logprob"])
+            self._settle(win, {**best, "temperature": d["temperature"]})
+
+    # --- a recording's windows ---------------------------------------------------------------------------
+    def _job(self, win: _Window) -> Job:
+        t = self.temperatures[win.ti]
+        return Job(win.prompt, t if t > 0 else 0.0, mix_seed(self.seed, win.rec.index, win.ordinal, win.ti),
+                   rows=self.best_of, key=win)
+
+    def _next_window(self, rec: _Recording) -> None:
+        if rec.seek >= rec.content_frames:
+            return
+        c = self.model.cfg
+        size = min(N_FRAMES, rec.content_frames - rec.seek)
+        feats = torch.zeros(c.n_mels, N_FRAMES, device=self.model.device)
+        feats[:, :size] = rec.features[:, rec.seek : rec.seek + size]
+        prompt = self.model.prompt(rec.language, self.task, self.without_timestamps,
+                                   previous_tokens=rec.all_tokens[rec.reset_since :])
+        self.ready.append(self._job(_Window(rec, feats, size, prompt)))
+
+    def _release(self, win: _Window) -> None:
+        if win.buffer is not None:
+            self.pool_free.append(win.buffer)
+            win.buffer = None
+
+    def _settle(self, win: _Window, d: dict) -> None:
+        """A window's final decode: skipped as silence, or its segments (after its word alignment)."""
+        rec = win.rec
+        cr, lp, ns = self.thresholds
+        if ns is not None:  # no voice activity: on to the next window
+            skip = d["no_speech_prob"] > ns
+            if lp is not None and d["avg_logprob"] > lp:
+                skip = False
+            if skip:
+                rec.seek += win.size
+                self._release(win)
+                self._next_window(rec)
+                return
+        tb = self.model.cfg.timestamp_begin
+        split = split_by_timestamps(d["tokens"], tb, win.seek * TIME_PER_FRAME, win.size, win.size * TIME_PER_FRAME,
+                                    win.seek)
+        if not self.word_timestamps:
+            self._finish(win, d, split, None)
+            return
+        eot = self.model.tokenizer.eot
+        text = [t for seg in split[0] for t in seg["tokens"] if t < eot]
+        if not text:
+            self.aligning.append((win, d, split, text, ([], [])))
+            return
+        if self.aligner is None:  # (no CUDA graphs and Triton: synchronously)
+            cross = self._cross_of(win, torch.cuda.current_stream())
+            self.aligning.append((win, d, split, text, align(self.decoder, self.model.cfg, rec.sot_sequence, text,
+                                                             cross[:, :, 0], win.size)))
+            return
+        side, main = self.model.side_stream, torch.cuda.current_stream()
+        if win.buffer is not None:
+            src, ready = self.pool[win.buffer], self.pool_ready[win.buffer]
+        else:  # (its keys/values not kept: encoded again)
+            with torch.cuda.stream(side):
+                side.wait_stream(main)  # (the window's features)
+                self.model.backend.encode(win.features[None], self.side_scratch, lane=1)
+            src, ready = self.side_scratch, _event(side)
+        handle = self.aligner.submit(src, ready, rec.sot_sequence, text, win.size)
+        if win.buffer is not None:
+            self.pool_reads[win.buffer].append(handle["used"])
+        self.aligning.append((win, d, split, text, handle))
+
+    def _cross_of(self, win: _Window, stream) -> torch.Tensor:
+        if win.buffer is not None:
+            return self.pool[win.buffer]
+        self.model.backend.encode(win.features[None], self.scratch)
+        return self.scratch
+
+    def _poll(self, wait: bool, one: bool = False) -> None:
+        """Finish the windows whose alignment is done (in order: they run on one stream)."""
+        while self.aligning:
+            win, d, split, text, handle = self.aligning[0]
+            if isinstance(handle, dict):
+                if not wait and not handle["done"].query():
+                    return
+                first, probs = Aligner.result(handle)
+            else:
+                first, probs = handle
+            self.aligning.popleft()
+            rec = win.rec
+            alignment = find_alignment(self.model.tokenizer, rec.language, text, first, probs) if text else []
+            self._finish(win, d, split, alignment)
+            if one:
+                return
+
+    def _finish(self, win: _Window, d: dict, split: tuple, alignment: list[dict] | None) -> None:
+        """faster-whisper's ``generate_segments`` after a window's decode: its segments, the next seek."""
+        rec = win.rec
+        current, seek, single_timestamp_ending = split
+        time_offset = win.seek * TIME_PER_FRAME
+        window_end_time = float((win.seek + N_FRAMES) * TIME_PER_FRAME)
+        duration = win.size * TIME_PER_FRAME
+        previous_seek = win.seek
+        tok = self.model.tokenizer
+        if self.word_timestamps:
+            rec.last_speech = add_word_timestamps(current, tok, rec.language, alignment, *self.punctuations,
+                                                  rec.last_speech)
+            if not single_timestamp_ending:
                 last_word_end = get_end(current)
-                if last_word_end is not None:
-                    r.last_speech = last_word_end
-            r.seek = seek
-            for seg in current:
-                text = tok.decode(seg["tokens"])
-                if seg["start"] == seg["end"] or not text.strip():
-                    continue
-                r.all_tokens.extend(seg["tokens"])
-                words = [Word(w["start"], w["end"], w["word"], w["probability"]) for w in seg["words"]] \
-                    if word_timestamps else None
-                r.segments.append(Segment(len(r.segments) + 1, previous_seek, seg["start"], seg["end"], text,
-                                          seg["tokens"], d.avg_logprob, d.compression_ratio, d.no_speech_prob,
-                                          words, d.temperature))
-            if not condition_on_previous_text or d.temperature > prompt_reset_on_temperature:
-                r.reset_since = len(r.all_tokens)
-    return [r.segments for r in recs]
-
-
-def _align(model, decoder, sot_sequence: list[int], language: str, jobs: list, batch_size: int) -> list[list[dict]]:
-    """faster-whisper's ``find_alignment`` for windows ``(features, text tokens, feature frames)``: their encoder
-    outputs (in batches), then each window's alignment."""
-    out = []
-    for i in range(0, len(jobs), batch_size):
-        part = jobs[i : i + batch_size]
-        need = [j for j, (_, text, _) in enumerate(part) if text]
-        cross = model.encode(torch.stack([part[j][0] for j in need])) if need else None
-        for j, (_, text, frames) in enumerate(part):
-            if not text:
-                out.append([])
+                if last_word_end is not None and last_word_end > time_offset:
+                    seek = round(last_word_end * FRAMES_PER_SECOND)
+            if self.hallucination_silence_threshold is not None:
+                seek, current, skipped = _skip_hallucinations(current, seek, previous_seek, time_offset, duration,
+                                                              window_end_time, rec,
+                                                              self.hallucination_silence_threshold)
+                if skipped:
+                    rec.seek = seek
+                    self._release(win)
+                    self._next_window(rec)
+                    return
+            last_word_end = get_end(current)
+            if last_word_end is not None:
+                rec.last_speech = last_word_end
+        rec.seek = seek
+        for seg in current:
+            text = tok.decode(seg["tokens"])
+            if seg["start"] == seg["end"] or not text.strip():
                 continue
-            path, probs = align(decoder, model.cfg, sot_sequence, text, cross[:, :, need.index(j)], frames)
-            out.append(find_alignment(model.tokenizer, language, text, path, probs))
-    return out
+            rec.all_tokens.extend(seg["tokens"])
+            words = [Word(w["start"], w["end"], w["word"], w["probability"]) for w in seg["words"]] \
+                if self.word_timestamps else None
+            rec.segments.append(Segment(len(rec.segments) + 1, previous_seek, seg["start"], seg["end"], text,
+                                        seg["tokens"], d["avg_logprob"], d["compression_ratio"], d["no_speech_prob"],
+                                        words, d["temperature"]))
+        if not self.condition_on_previous_text or d["temperature"] > self.prompt_reset_on_temperature:
+            rec.reset_since = len(rec.all_tokens)
+        self._release(win)
+        self._next_window(rec)
+
+
+def _event(stream) -> torch.cuda.Event:
+    ev = torch.cuda.Event()
+    ev.record(stream)
+    return ev
+
+
+def _triton_ok() -> bool:
+    from .alignment import triton
+
+    return triton is not None
 
 
 def _skip_hallucinations(current: list[dict], seek: int, previous_seek: int, time_offset: float, duration: float,

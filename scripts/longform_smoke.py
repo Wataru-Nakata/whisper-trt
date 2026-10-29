@@ -1,7 +1,9 @@
 """Long-form transcription on a few recordings of a long-*.npz (Whisper.transcribe): segments and words printed,
 the time taken.
 
-    python scripts/longform_smoke.py WAVES.npz --lang ja [--n 3] [--word-timestamps]
+    python scripts/longform_smoke.py WAVES.npz [--lang ja] [--n 3] [--word-timestamps]
+
+Without --lang, each recording's language is detected.
 """
 
 import argparse
@@ -17,7 +19,7 @@ from whisper_trt import Whisper
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("waves")
-    ap.add_argument("--lang", required=True)
+    ap.add_argument("--lang")
     ap.add_argument("--n", type=int, default=3)
     ap.add_argument("--word-timestamps", action="store_true")
     args = ap.parse_args()
@@ -32,7 +34,8 @@ def main() -> None:
     audio_s = sum(len(w) for w in waves) / 16000
     print(f"{len(waves)} recordings, {audio_s:.0f} s of audio in {sec:.1f} s (RTFx {audio_s / sec:.0f})", flush=True)
     for i, segs in enumerate(out):
-        print(f"--- recording {i}: {len(segs)} segments", flush=True)
+        print(f"--- recording {i}: {len(segs)} segments, language {segs.language} ({segs.language_probability:.2f})",
+              flush=True)
         for s in segs[:6]:
             print(f"[{s.start:7.2f} -> {s.end:7.2f}] t={s.temperature} {s.text[:80]}", flush=True)
             if s.words:

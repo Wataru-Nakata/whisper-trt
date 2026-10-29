@@ -88,6 +88,7 @@ class Whisper:
         self._cross_flat = torch.empty(0, dtype=backend.dtype, device=self.device)  # (grown on demand: cross)
         self._searches: dict[tuple, Search] = {}
         self._prefills: dict[tuple, tuple] = {}
+        self._aligners: dict[int, object] = {}
 
     @classmethod
     def from_pretrained(
@@ -192,13 +193,26 @@ class Whisper:
         self.backend.encode(feats.to(self.device, torch.float32).contiguous(), cross)
         return cross
 
-    def _search(self, mode: str, windows: int, rows: int, prompt_length: int, timestamps: bool = False) -> Search:
-        key = (mode, windows, rows, prompt_length, timestamps)
+    def _search(self, mode: str, windows: int, rows: int, prompt_length: int | None, timestamps: bool = False,
+                mixed: bool = False) -> Search:
+        """``mixed``: windows sampled at a temperature in the same steps (Search's ``sampling_slots``)."""
+        key = (mode, windows, rows, prompt_length, timestamps, mixed)
         if key not in self._searches:
             step = partial(self.backend.step_fn, cross=self.cross(windows))
             self._searches[key] = Search(self.cfg, step, windows, rows, prompt_length, mode,
-                                         dtype=self.backend.dtype, device=self.device, timestamps=timestamps)
+                                         dtype=self.backend.dtype, device=self.device, timestamps=timestamps,
+                                         sampling_slots=mixed)
         return self._searches[key]
+
+    def _aligner(self, decoder):
+        """The word alignment's alignment.Aligner for ``decoder`` (on the side stream; graphs captured once)."""
+        from .alignment import Aligner
+
+        if id(decoder) not in self._aligners:
+            aligner = Aligner(decoder, self.cfg, self.device, self.side_stream)
+            aligner.prepare()
+            self._aligners[id(decoder)] = aligner
+        return self._aligners[id(decoder)]
 
     def _timestamps(self, prompt: list[int]) -> bool:
         """Whether a prompt decodes with timestamps: as CTranslate2 decides, unless it ends with
@@ -388,16 +402,22 @@ class Whisper:
 
     # --- long-form, with faster-whisper's rules -----------------------------------------------------------
     @_on_stream
-    def transcribe(self, audio: list[AudioLike], language: str, task: str = "transcribe", **options):
+    def transcribe(self, audio: list[AudioLike], language: str | None = None, task: str = "transcribe",
+                   **options):
         """Recordings of any length transcribed as faster-whisper's ``WhisperModel.transcribe`` transcribes
         each (``longform.transcribe``: window by window from a seek position, conditioned on the previous text,
-        with the temperature fallback, timestamps and optionally word timestamps), ``batch_size`` windows of
-        different recordings decoding at a time. Returns each recording's segments (longform.Segment, with
-        ``words`` if ``word_timestamps=True``). Options: those of faster-whisper's (beam_size, best_of,
-        temperatures, compression_ratio_threshold, log_prob_threshold, no_speech_threshold,
-        condition_on_previous_text, prompt_reset_on_temperature, initial_prompt, suppress_blank,
-        suppress_tokens, without_timestamps, max_initial_timestamp, word_timestamps, prepend_punctuations,
-        append_punctuations, hallucination_silence_threshold), batch_size, seed."""
+        with the temperature fallback, timestamps and optionally word timestamps), the windows of all the
+        recordings streaming through ``batch_size`` slots: a recording's next window starts as soon as its
+        previous one is decided. ``language=None``: each recording's detected from its first 30 s (as
+        faster-whisper's ``detect_language``). Returns each recording's segments (a longform.Transcript: a list
+        of longform.Segment, with ``words`` if ``word_timestamps=True``, and its ``language``). Options: those
+        of faster-whisper's (beam_size, best_of, temperatures, compression_ratio_threshold, log_prob_threshold,
+        no_speech_threshold, condition_on_previous_text, prompt_reset_on_temperature, initial_prompt,
+        suppress_blank, suppress_tokens, without_timestamps, max_initial_timestamp, word_timestamps,
+        prepend_punctuations, append_punctuations, hallucination_silence_threshold,
+        language_detection_threshold, language_detection_segments), batch_size, ``kv_pool`` (windows whose
+        keys/values are kept for their retries and alignment, default ``batch_size + 8``), seed (a window's
+        samples depend on it, the recording's index, the window's and the temperature's only)."""
         from .longform import transcribe
 
         return transcribe(self, audio, language, task, **options)

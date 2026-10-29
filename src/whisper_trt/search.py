@@ -11,6 +11,12 @@ slot):
 * greedy (``mode="greedy"``, K = 1) and sampling (``mode="sample"``, K = best_of independent rows; softmax of
   ``log_probs / temperature``; the scores stay those of the untempered log-probabilities): CTranslate2's
   ``GreedySearch``; the best of a window's K rows by score / length wins.
+* with ``sampling_slots=True``, a beam or greedy search also samples the windows given a temperature, slot by
+  slot (best_of of its K rows, the others done from the start; greedy windows use one row): windows at
+  temperature 0 and the temperature fallback's samples decode together (:meth:`Search.serve`).
+
+A sampled window's random numbers are a function of its seed, its step and each (row of the window, token)
+(:func:`uniform`): not of the slot it decodes in, so a window decodes the same in any slot, at any time.
 
 Every step disables the suppressed tokens (to the lowest float, as ``DisableTokens``), and a window's first step
 also the "begin" tokens (blank, EOS). At most ``min(max_length // 2, max_length - (prompt length - 1))`` tokens
@@ -23,15 +29,18 @@ A step is all device work (decoder call, token choice) on fixed buffers, capture
 has its own position, so windows of any lengths share the steps. The host checks the slots after every few steps
 and refills those whose window is done with the next window (:meth:`Search.stream`): a batch does not wait for
 its slowest window. The checks read flags copied asynchronously a few steps back, so the GPU always has steps
-queued while the host collects results and loads windows. Beam search never moves the KV cache: each row has a
-table ``src`` [N, C] of the row whose cache holds each of its slots (attn_plugin.self_attn); a new beam takes its
-parent's table, and the token it is fed next is written to its own row's slot.
+queued while the host collects results and loads windows. :meth:`Search.serve` takes the windows from a source
+that may release more as results come back (the next window of a recording, a retry at a higher temperature).
+Beam search never moves the KV cache: each row has a table ``src`` [N, C] of the row whose cache holds each of
+its slots (attn_plugin.self_attn); a new beam takes its parent's table, and the token it is fed next is written
+to its own row's slot.
 """
 
 import os
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 
@@ -80,6 +89,45 @@ def max_new_tokens(prompt_length: int, max_length: int = 448) -> int:
     return min(max_length // 2, max_length - (prompt_length - 1))
 
 
+def mix_seed(*parts: int) -> int:
+    """A 31-bit seed from integers (splitmix64's finalizer over each): e.g. a window's from the decode's seed and
+    the window's index."""
+    m = 0xFFFFFFFFFFFFFFFF
+    x = 0x9E3779B97F4A7C15
+    for p in parts:
+        x = ((x ^ (p & m)) * 0xBF58476D1CE4E5B9) & m
+        x = ((x ^ (x >> 31)) * 0x94D049BB133111EB) & m
+        x ^= x >> 29
+    return x & 0x7FFFFFFF
+
+
+def uniform(seed: torch.Tensor, t: torch.Tensor, row: torch.Tensor, vocab: int) -> torch.Tensor:
+    """Uniform random numbers [n, vocab] in (0, 1) for n rows, from each row's seed, step and row within its window
+    ([n] each, int64): a counter-based hash (PCG's output function, on 32-bit words in int64 arithmetic) of
+    (seed, step, row, token). No generator state, so it runs inside a captured CUDA graph (torch's generator does
+    not, on the model's stream); a window's numbers do not depend on the slot it is in."""
+    mask = 0xFFFFFFFF
+    v = torch.arange(vocab, device=seed.device)
+    x = (row[:, None] * vocab + v + (seed[:, None] * 0x6C8E9CF5 + t[:, None] * 0x85EBCA77)) & mask  # (< 2**63)
+    for _ in range(2):
+        x = (x * 747796405 + 2891336453) & mask
+        x = (((x >> ((x >> 28) + 4)) ^ x) * 277803737) & mask
+        x = ((x >> 22) ^ x) & mask
+    return (x.float() + 0.5) / 4294967296.0
+
+
+@dataclass
+class Job:
+    """A window for :meth:`Search.serve`: its prompt, its temperature (> 0: sampled, ``rows`` of the slot's rows,
+    by default all of them) and its random numbers' seed; ``key`` is the source's."""
+
+    prompt: list[int]
+    temperature: float = 0.0
+    seed: int = 0
+    rows: int | None = None
+    key: Any = None
+
+
 def cache_buckets(capacity: int, smallest: int = 64) -> list[int]:
     out, c = [], smallest
     while c < capacity:
@@ -111,12 +159,15 @@ class Search:
         graphs: bool | None = None,
         fused: bool | None = None,
         timestamps: bool = False,
+        sampling_slots: bool = False,
     ):
         if mode not in ("beam", "greedy", "sample"):
             raise ValueError(f"unknown search mode {mode!r}")
-        if mode == "greedy" and rows != 1:
+        if mode == "greedy" and rows != 1 and not sampling_slots:
             raise ValueError("greedy search has one row per window")
         self.cfg, self.mode, self.device = cfg, mode, torch.device(device)
+        # windows of the beam / greedy search sampled slot by slot (see the module doc)
+        self.mixed = sampling_slots and mode != "sample"
         self.B, self.K, self.N = batch, rows, batch * rows
         # prompt_length None: prompts of any length, all but their last token prefilled (see stream)
         self.prefilled = prompt_length is None
@@ -153,7 +204,8 @@ class Search:
         self.done = torch.ones(B, dtype=torch.bool, device=dev)  # (empty slots are done)
         self.row_done = torch.ones(N, dtype=torch.bool, device=dev)  # greedy/sampling rows
         self.length = torch.zeros(N, dtype=torch.long, device=dev)  # greedy/sampling: tokens without EOS
-        self.temperature = torch.ones(1, dtype=torch.float32, device=dev)
+        self.temperature = torch.ones(B, dtype=torch.float32, device=dev)  # per slot
+        self.sampling = torch.full((B,), mode == "sample", dtype=torch.bool, device=dev)  # per slot
         # decoding with timestamps (CTranslate2's ApplyTimestampRules, see _timestamp_rules)
         self.timestamps = timestamps
         if timestamps and not cfg.timestamp_begin:
@@ -161,9 +213,8 @@ class Search:
         self.max_initial = torch.full((1,), 50, dtype=torch.long, device=dev)  # (index past timestamp_begin)
         self.vocab_ids = torch.arange(V, device=dev)
         self.hist_ids = torch.arange(T, device=dev)
-        self.seed = torch.zeros(1, dtype=torch.int64, device=dev)
-        if mode == "sample":  # (row, token) counters of the random numbers, see _uniform
-            self.counter = (torch.arange(N, device=dev)[:, None] * V + torch.arange(V, device=dev)).view(N, V)
+        self.seed = torch.zeros(B, dtype=torch.int64, device=dev)  # per slot: its window's random numbers'
+        self.row_in = torch.arange(N, device=dev) % K  # each row's index in its window
         if mode == "beam":
             S = 2 * K + 1  # finished hypotheses: at most K - 1 + K, and a slot for the ones not registered
             self.h_count = torch.zeros(B, dtype=torch.long, device=dev)
@@ -178,6 +229,9 @@ class Search:
         if fused:
             self.scores = torch.zeros(N, V, dtype=torch.float32, device=dev)
             self.ns = torch.zeros(B, dtype=torch.float32, device=dev)
+            if self.mixed:  # each sampled row's token and its log-probability
+                self.samp_tok = torch.zeros(N, dtype=torch.long, device=dev)
+                self.samp_score = torch.zeros(N, dtype=torch.float32, device=dev)
         self._step: Callable | None = None
         self._graph: torch.cuda.CUDAGraph | None = None
 
@@ -194,9 +248,11 @@ class Search:
         self._step()
         if not getattr(self._step, "writes_cache", False):  # (a backend may write them into the cache itself)
             self.cache[:, :, self.row_ar, :, self.offset, :] = self.new_kv[:, :, :, :, 0, :].permute(2, 0, 1, 3, 4)
-        if self.fused:  # the same as below, in three kernels
+        if self.fused:  # the same as below, in three kernels (four with sampled slots)
             beam_kernels.scores(self, self.logits[:, 0], self.scores, self.ns)
             top_s, top_i = self.scores.view(self.B, -1).topk(2 * self.K, dim=1)
+            if self.mixed:
+                beam_kernels.sample(self)
             beam_kernels.update(self, top_s, top_i, self.ns)
             return
         self.src[self.row_ar, self.offset] = self.row_ids[:, 0]
@@ -232,7 +288,19 @@ class Search:
         logp = logits.log_softmax(-1)  # [N, V]
         prompt = (self.t < 0).repeat_interleave(self.K)  # [N]: rows still fed their prompt
         kept = (self.hist.clone(), self.cum.clone(), self.src.clone())
-        if self.mode == "beam":
+        if self.mode == "beam" and self.mixed:  # both, then each slot takes its own
+            state = (self.hist, self.cum, self.src, self.done, self.tokens)
+            before = [x.clone() for x in state]
+            self._beam(logp, prompt)
+            beam = [x.clone() for x in state]
+            for x, b in zip(state, before):
+                x.copy_(b)
+            self._greedy(logp, prompt)
+            rows = self.sampling.repeat_interleave(self.K)
+            for x, b in zip(state, beam):
+                m = self.sampling if x is self.done else rows
+                x.copy_(torch.where(m.view(-1, *([1] * (x.dim() - 1))), x, b))
+        elif self.mode == "beam":
             self._beam(logp, prompt)
         else:
             self._greedy(logp, prompt)
@@ -272,26 +340,17 @@ class Search:
         return logits.masked_fill((check & sample_ts)[:, None] & (v < tb), LOWEST)
 
     def _uniform(self) -> torch.Tensor:
-        """Uniform random numbers [N, V] in (0, 1) from a counter-based hash (PCG's output function, on 32-bit
-        words in int64 arithmetic) of the seed, the window's step and each (row, token): no generator state, so
-        it runs inside a captured CUDA graph (torch's generator does not, on the model's stream), and a seed
-        gives the same samples."""
-        mask = 0xFFFFFFFF
-        t = self.t.repeat_interleave(self.K)[:, None]
-        x = (self.counter + (self.seed * 0x6C8E9CF5 + t * 0x85EBCA77)) & mask  # (products < 2**63)
-        for _ in range(2):
-            x = (x * 747796405 + 2891336453) & mask
-            x = (((x >> ((x >> 28) + 4)) ^ x) * 277803737) & mask
-            x = ((x >> 22) ^ x) & mask
-        return (x.float() + 0.5) / 4294967296.0
+        """The rows' random numbers [N, V] at this step (:func:`uniform`)."""
+        K = self.K
+        return uniform(self.seed.repeat_interleave(K), self.t.repeat_interleave(K), self.row_in, self.cfg.vocab_size)
 
     def _greedy(self, logp: torch.Tensor, prompt: torch.Tensor) -> None:
-        if self.mode == "sample":
-            scaled = (logp / self.temperature).log_softmax(-1)
+        token = logp.argmax(-1)
+        if self.mode == "sample" or self.mixed:
+            temperature = self.temperature.repeat_interleave(self.K)[:, None]
             u = self._uniform().clamp_(min=1e-20)
-            token = (scaled - (-u.log()).log()).argmax(-1)  # Gumbel-max: a sample of softmax(logp / T)
-        else:
-            token = logp.argmax(-1)
+            sampled = (logp / temperature - (-u.log()).log()).argmax(-1)  # Gumbel-max: a sample of softmax(logp / T)
+            token = torch.where(self.sampling.repeat_interleave(self.K), sampled, token)
         t = self.t.repeat_interleave(self.K).clamp(min=0)  # [N]
         live = ~self.row_done & ~prompt
         score = logp.gather(1, token[:, None])[:, 0]
@@ -312,7 +371,7 @@ class Search:
         tok, par = top_i % V, top_i // V
         eos = tok == self.cfg.eot
         last = (self.t == self.last_t)[:, None].expand(B, K)
-        live = ~self.done[:, None] & ~prompt.view(B, K)[:, :1]
+        live = ~self.done[:, None] & ~prompt.view(B, K)[:, :1] & ~self.sampling[:, None]
         finish = (eos[:, :K] | last) & live  # [B, K]: hypotheses registered this step
         # register them: slot count + rank, beyond the hypotheses' storage for the others
         rank = finish.long().cumsum(1) - 1
@@ -349,16 +408,26 @@ class Search:
         torch.index_select(self.src, 0, rows, out=self.src_scratch)
         self.src.copy_(self.src_scratch)
 
-    # --- driver -----------------------------------------------------------------------------------------
-    def _start(self, slots: list[int], prompts: list[list[int]]) -> None:
+    # --- driver ---------------------------------------------------------------------------------------
+    def _sampled(self, job: Job) -> bool:
+        return self.mode == "sample" or (self.mixed and job.temperature > 0)
+
+    def _used(self, job: Job) -> int:
+        """The rows a window uses: all K in beam search, one greedy, ``rows`` (default K) sampled."""
+        if self._sampled(job):
+            return min(job.rows or self.K, self.K)
+        return self.K if self.mode == "beam" else 1
+
+    def _start(self, slots: list[int], jobs: list[Job]) -> None:
         """Load windows into ``slots``: their prompts are fed from the next step on (the slot's position 0, then
         one token per step, see _choose); prefilled, only the prompt's last token is (at its position; the
         beams' slot tables point to the first row, which holds the prefilled keys/values). Only asynchronous
         writes from pinned memory: the queued steps go on."""
         K, P, dev = self.K, self.P, self.device
+        prompts = [j.prompt for j in jobs]
 
-        def to_dev(x) -> torch.Tensor:
-            return torch.tensor(x, dtype=torch.long, pin_memory=True).to(dev, non_blocking=True)
+        def to_dev(x, dtype=torch.long) -> torch.Tensor:
+            return torch.tensor(x, dtype=dtype, pin_memory=dev.type == "cuda").to(dev, non_blocking=True)
 
         s_idx = to_dev(slots)
         r_idx = (s_idx[:, None] * K + torch.arange(K, device=dev)).view(-1)
@@ -376,16 +445,122 @@ class Search:
             self.pos.index_fill_(0, s_idx, 0)
             self.src[r_idx] = self.row_ids[r_idx]
         self.t.index_fill_(0, s_idx, -(P - 1))
-        first = torch.arange(len(r_idx), device=dev) % K == 0  # only the first beam takes part in the first step
-        self.cum[r_idx] = torch.where(first | (self.mode != "beam"), 0.0, float("-inf"))
+        sampled = [self._sampled(j) for j in jobs]
+        used = [self._used(j) for j in jobs]
+        # beam search: only the first beam takes part in the first step; rows a window does not use are done
+        self.cum[r_idx] = to_dev([0.0 if k == 0 or self.mode != "beam" or smp else float("-inf")
+                                  for smp in sampled for k in range(K)], torch.float32)
+        self.row_done[r_idx] = to_dev([k >= u for u in used for k in range(K)], torch.bool)
+        self.sampling[s_idx] = to_dev(sampled, torch.bool)
+        self.temperature[s_idx] = to_dev([j.temperature if smp else 1.0 for j, smp in zip(jobs, sampled)],
+                                         torch.float32)
+        self.seed[s_idx] = to_dev([j.seed & 0x7FFFFFFF for j in jobs])
         if self.mode == "beam":
             self.h_count.index_fill_(0, s_idx, 0)
             self.h_score.index_fill_(0, s_idx, float("-inf"))
             self.h_len.index_fill_(0, s_idx, 0)
         self.hist.index_fill_(0, r_idx, 0)
         self.length.index_fill_(0, r_idx, 0)
-        self.row_done.index_fill_(0, r_idx, False)
         self.done.index_fill_(0, s_idx, False)
+
+    def serve(
+        self,
+        source,
+        suppress: list[int],
+        begin_suppress: list[int],
+        check_every: int = 1,
+        ahead: int = 1,
+        max_initial_timestamp_index: int = 50,
+        prefill: Callable[[list[int], list[list[int]]], None] | None = None,
+    ) -> None:
+        """Decode the windows a ``source`` gives, at most B at a time, until it has no more:
+
+        * ``source.take(n, block)``: up to n :class:`Job` ready now (``block=True``: when no window decodes,
+          waiting for the source's own work in flight, e.g. a word alignment, until one is or none will be);
+        * ``source.load(slots, jobs)``: their cross-attention keys/values into those slots (on the current
+          stream, before the next step);
+        * ``source.finished(slots, jobs)`` (optional): the windows in those slots are done; their keys/values stay
+          until the slots are loaded again;
+        * ``source.result(job, result)``: a window's result, which may release more jobs.
+
+        A slot whose window is done, or that found none at a check, takes a job at every later check. Prefilled
+        (``prompt_length=None``): prompts of any length, ``prefill(slots, prompts)`` writing the keys/values of
+        all but each prompt's last token into the slot's first row of the cache (positions from 0) and the
+        window's no-speech probability into ``no_speech``, as CTranslate2 runs a prompt before its decode.
+
+        The slots' done flags are copied to the host after every ``check_every`` steps and read ``ahead``
+        checks later, so ``ahead * check_every`` steps stay queued while the host collects the finished windows
+        (also asynchronously) and loads the next ones; a finished window's slot runs that many more steps
+        (which change nothing in it) before it is refilled."""
+        self.prepare()
+        self.suppress.zero_()
+        if suppress:
+            self.suppress[torch.tensor(list(suppress), device=self.device)] = True
+        self.begin.zero_()
+        if begin_suppress:
+            self.begin[torch.tensor(list(begin_suppress), device=self.device)] = True
+        self.max_initial.fill_(max_initial_timestamp_index)
+        self.done.fill_(True)
+        self.row_done.fill_(True)
+        job_of: list[Job | None] = [None] * self.B  # the window in each slot
+        loaded = [-1] * self.B  # the last check before each slot's window was loaded (older flags are stale)
+        free = list(range(self.B))
+        flags: deque = deque()  # (event, done flags on the host, check), oldest first
+        finished: deque = deque()  # (jobs, their final state on the host) not yet results
+        checks = 0
+        finished_hook = getattr(source, "finished", None)
+
+        def fill(block: bool = False) -> None:
+            if not free:
+                return
+            jobs = source.take(len(free), block)
+            if not jobs:
+                return
+            free.sort()
+            slots = [free.pop(0) for _ in jobs]
+            source.load(slots, jobs)
+            if self.prefilled:
+                prefill(slots, [j.prompt for j in jobs])
+            self._start(slots, jobs)
+            for s, j in zip(slots, jobs):
+                job_of[s] = j
+                loaded[s] = checks - 1
+
+        def collect(wait: bool) -> None:
+            while finished and (wait or _ready(finished[0][1][0])):
+                jobs, state = finished.popleft()
+                for j, r in zip(jobs, self._results(state, jobs)):
+                    source.result(j, r)
+
+        fill()
+        while True:
+            if all(j is None for j in job_of):  # results in flight, or the source's own work, may release more
+                collect(wait=True)
+                fill(block=True)
+                if all(j is None for j in job_of):
+                    break
+            for _ in range(check_every):
+                self._run_step()
+            done = _to_host(self.done)
+            flags.append((_record(self.device), done, checks))  # (the event after the copy)
+            checks += 1
+            if len(flags) <= ahead:
+                continue
+            ev, done, check = flags.popleft()
+            _wait(ev)
+            done = done.tolist()
+            slots = [s for s in range(self.B) if job_of[s] is not None and done[s] and check > loaded[s]]
+            if slots:
+                jobs = [job_of[s] for s in slots]
+                finished.append((jobs, self._final_state(slots)))
+                if finished_hook is not None:
+                    finished_hook(slots, jobs)
+                for s in slots:
+                    job_of[s] = None
+                free.extend(slots)
+            collect(wait=False)
+            fill()
+        collect(wait=True)
 
     def stream(
         self,
@@ -400,84 +575,14 @@ class Search:
         max_initial_timestamp_index: int = 50,
         prefill: Callable[[list[int], list[list[int]]], None] | None = None,
     ) -> list[WindowResult]:
-        """Decode len(prompts) windows (prompts of length P), at most B at a time: a slot whose window is done
-        takes the next one. ``load(slots, windows)`` puts the windows' cross-attention keys/values into those
-        slots (on the current stream, before the next step). Prefilled (``prompt_length=None``): prompts of any
-        length, ``prefill(slots, prompts)`` writing the keys/values of all but each prompt's last token into the
-        slot's first row of the cache (positions from 0) and the window's no-speech probability into
-        ``no_speech``, as CTranslate2 runs a prompt before its decode.
-
-        The slots' done flags are copied to the host after every ``check_every`` steps and read ``ahead``
-        checks later, so ``ahead * check_every`` steps stay queued while the host collects the finished windows
-        (also asynchronously) and loads the next ones; a finished window's slot runs that many more steps
-        (which change nothing in it) before it is refilled."""
-        self.prepare()
-        self.suppress.zero_()
-        if suppress:
-            self.suppress[torch.tensor(list(suppress), device=self.device)] = True
-        self.begin.zero_()
-        if begin_suppress:
-            self.begin[torch.tensor(list(begin_suppress), device=self.device)] = True
-        self.temperature.fill_(temperature)
-        self.max_initial.fill_(max_initial_timestamp_index)
-        self.seed.fill_(seed & 0x7FFFFFFF)
-        self.done.fill_(True)
-        self.row_done.fill_(True)
-        M = len(prompts)
-        results: list[WindowResult | None] = [None] * M
-        window = [-1] * self.B  # the window in each slot
-        loaded = [-1] * self.B  # the last check before each slot's window was loaded (older flags are stale)
-        flags: deque = deque()  # (event, done flags on the host, check), oldest first
-        finished: deque = deque()  # (windows, their final state on the host) not yet results
-        checks = 0
-        nxt = 0
-
-        def fill(slots: list[int]) -> None:
-            nonlocal nxt
-            pairs = []
-            for s in slots:
-                if nxt < M:
-                    pairs.append((s, nxt))
-                    nxt += 1
-            if not pairs:
-                return
-            load([s for s, _ in pairs], [w for _, w in pairs])
-            if self.prefilled:
-                prefill([s for s, _ in pairs], [prompts[w] for _, w in pairs])
-            self._start([s for s, _ in pairs], [prompts[w] for _, w in pairs])
-            for s, w in pairs:
-                window[s] = w
-                loaded[s] = checks - 1
-
-        def collect(wait: bool) -> None:
-            while finished and (wait or _ready(finished[0][1][0])):
-                windows, state = finished.popleft()
-                limits = [max_new_tokens(len(prompts[w]), self.max_length) if self.prefilled else self.max_new
-                          for w in windows]
-                for w, r in zip(windows, self._results(state, limits)):
-                    results[w] = r
-
-        fill(list(range(self.B)))
-        while any(w >= 0 for w in window):
-            for _ in range(check_every):
-                self._run_step()
-            done = _to_host(self.done)
-            flags.append((_record(self.device), done, checks))  # (the event after the copy)
-            checks += 1
-            if len(flags) <= ahead:
-                continue
-            ev, done, check = flags.popleft()
-            _wait(ev)
-            done = done.tolist()
-            slots = [s for s in range(self.B) if window[s] >= 0 and done[s] and check > loaded[s]]
-            if slots:
-                finished.append(([window[s] for s in slots], self._final_state(slots)))
-                for s in slots:
-                    window[s] = -1
-                fill(slots)
-            collect(wait=False)
-        collect(wait=True)
-        return results
+        """Decode len(prompts) windows (:meth:`serve`): ``load(slots, windows)`` puts the windows' (indices')
+        cross-attention keys/values into those slots. Sampled (``mode="sample"``) at ``temperature``, window w
+        with the seed ``mix_seed(seed, w)``."""
+        jobs = [Job(p, temperature if self.mode == "sample" else 0.0, mix_seed(seed, w), key=w)
+                for w, p in enumerate(prompts)]
+        source = _ListSource(jobs, load)
+        self.serve(source, suppress, begin_suppress, check_every, ahead, max_initial_timestamp_index, prefill)
+        return source.results
 
     def run(self, prompt: torch.Tensor, suppress: list[int], begin_suppress: list[int], temperature: float = 1.0,
             seed: int = 0, check_every: int = 1, ahead: int = 1,
@@ -491,33 +596,57 @@ class Search:
         asynchronously (queued before the slots are loaded again): see :meth:`_results`."""
         dev, K = self.device, self.K
         idx = torch.tensor(slots, dtype=torch.long, pin_memory=dev.type == "cuda").to(dev, non_blocking=True)
+        rows = (idx[:, None] * K + torch.arange(K, device=dev)).view(-1)
+        parts = [self.no_speech[idx]]
         if self.mode == "beam":
-            parts = [self.no_speech[idx], self.h_count[idx], self.h_score[idx], self.h_len[idx], self.h_tokens[idx]]
-        else:
-            rows = (idx[:, None] * K + torch.arange(K, device=dev)).view(-1)
-            parts = [self.no_speech[idx], self.hist[rows], self.cum[rows], self.length[rows]]
+            parts += [self.h_count[idx], self.h_score[idx], self.h_len[idx], self.h_tokens[idx]]
+        if self.mode != "beam" or self.mixed:
+            parts += [self.hist[rows], self.cum[rows], self.length[rows]]
         parts = [_to_host(p) for p in parts]
         return _record(dev), parts
 
-    def _results(self, state: tuple, max_new: list[int]) -> list[WindowResult]:
+    def _results(self, state: tuple, jobs: list[Job]) -> list[WindowResult]:
         ev, parts = state
         _wait(ev)
         K = self.K
-        out = []
+        parts = [p.tolist() for p in parts]
+        no_speech = parts[0]
         if self.mode == "beam":
-            no_speech, count, score, lengths, tokens = (p.tolist() for p in parts)
-            for j in range(len(no_speech)):
+            count, score, lengths, tokens = parts[1:5]
+        if self.mode != "beam" or self.mixed:
+            hist, cum, length = parts[-3:]
+        out = []
+        for j, job in enumerate(jobs):
+            max_new = max_new_tokens(len(job.prompt), self.max_length) if self.prefilled else self.max_new
+            if self.mode == "beam" and not self._sampled(job):
                 hyps = [Hypothesis(tokens[j][i][: lengths[j][i]], score[j][i], lengths[j][i])
                         for i in range(min(count[j], 2 * K))]
-                best = max(hyps, key=lambda h: h.normalized)
-                out.append(WindowResult(best, no_speech[j], hyps, max_new[j]))
-            return out
-        no_speech, hist, cum, length = (p.tolist() for p in parts)
-        for j in range(len(no_speech)):
-            hyps = [Hypothesis(hist[r][: length[r]], cum[r], length[r]) for r in range(j * K, (j + 1) * K)]
+            else:
+                hyps = [Hypothesis(hist[r][: length[r]], cum[r], length[r])
+                        for r in range(j * K, j * K + self._used(job))]
             best = max(hyps, key=lambda h: h.normalized)
-            out.append(WindowResult(best, no_speech[j], hyps, max_new[j]))
+            out.append(WindowResult(best, no_speech[j], hyps, max_new))
         return out
+
+
+class _ListSource:
+    """Search.serve's source for a fixed list of jobs (:meth:`Search.stream`): results by the jobs' order."""
+
+    def __init__(self, jobs: list[Job], load: Callable[[list[int], list[int]], None]):
+        self.jobs, self.load_fn = jobs, load
+        self.next = 0
+        self.results: list[WindowResult | None] = [None] * len(jobs)
+
+    def take(self, n: int, block: bool = False) -> list[Job]:
+        out = self.jobs[self.next : self.next + n]
+        self.next += len(out)
+        return out
+
+    def load(self, slots: list[int], jobs: list[Job]) -> None:
+        self.load_fn(slots, [j.key for j in jobs])
+
+    def result(self, job: Job, result: WindowResult) -> None:
+        self.results[job.key] = result
 
 
 def _to_host(t: torch.Tensor) -> torch.Tensor:

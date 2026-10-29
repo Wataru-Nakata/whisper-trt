@@ -269,23 +269,24 @@ its first 30 s of the whole-recording features: on the 60 recordings above (fp32
 * **Long-form** (`whisper_trt/longform.py`). A recording's features are computed once over the whole recording
   (one normalization, as faster-whisper's), and each window is up to 30 s of them from the recording's seek,
   with faster-whisper's prompt (`<|startofprev|>` and at most 223 tokens of the text since the last reset).
-  Without a language, each recording's is detected from its first 30 s (faster-whisper's `detect_language`:
-  the top language of the first `language_detection_segments` windows, by `language_detection_threshold`).
-  The windows of all the recordings stream through one search (`Search.serve`: a source gives windows as
-  results come back): a window's result decides at once between its retry at the next temperature (queued
-  first) and its recording's next window, so slots refill without waiting for any other recording. Windows at
-  temperature 0 (beam search) and the fallback's samples (best_of rows of a slot, at the slot's own temperature
-  and seed) decode in the same steps: per slot, the fused kernels take beam search's or GreedySearch's rules
+  Without a language, each recording's is detected from its first 30 s (faster-whisper's `detect_language`: the
+  top language of the first `language_detection_segments` windows, by `language_detection_threshold`). The
+  windows of all the recordings stream through one search (`Search.serve`: a source gives windows as results
+  come back): a window's result decides at once between its retry at the next temperature (queued first) and its
+  recording's next window, so slots refill without waiting for any other recording. Windows at temperature 0
+  (beam search) and the fallback's samples (best_of rows of a slot, at the slot's own temperature and seed)
+  decode in the same steps: per slot, the fused kernels take beam search's or GreedySearch's rules
   (`tests/test_serve.py`: mixed slots against CTranslate2's loops, windows released one by one at 2 and 4
-  slots). A window's keys/values, encoded once into a pool (`kv_pool`, by default `batch_size + 8` buffers of
-  245 MB), serve its retries and its word alignment. Then faster-whisper's rules: a silent window skipped, the
-  tokens split into segments, the seek moved to the last timestamp (with word timestamps, the last word's end),
-  the prompt reset after a decode above temperature 0.5, `hallucination_silence_threshold` (implemented, not
-  compared: the comparisons above use faster-whisper's defaults, as for `initial_prompt`). Prompts of any
-  length run in the search's prefilled mode: a window's prompt but its last token goes through one decoder call
-  (outside the captured graph) into its slot's cache, and the step graph goes on from the slot's own position,
-  with CTranslate2's limit for that prompt, `min(224, 448 - prompt + 1)` new tokens (`tests/test_search.py`:
-  prompts of different lengths in refilled slots, against CTranslate2's loops).
+  slots). A window's keys/values, encoded once into a pool (`kv_pool` buffers of 245 MB, by default
+  `min(recordings, batch_size + 8)`), serve its retries and its word alignment. Then faster-whisper's rules: a
+  silent window skipped, the tokens split into segments, the seek moved to the last timestamp (with word
+  timestamps, the last word's end), the prompt reset after a decode above temperature 0.5,
+  `hallucination_silence_threshold` (implemented, not compared: the comparisons above use faster-whisper's
+  defaults, as for `initial_prompt`). Prompts of any length run in the search's prefilled mode: a window's
+  prompt but its last token goes through one decoder call (outside the captured graph) into its slot's cache,
+  and the step graph goes on from the slot's own position, with CTranslate2's limit for that prompt, `min(224,
+  448 - prompt + 1)` new tokens (`tests/test_search.py`: prompts of different lengths in refilled slots, against
+  CTranslate2's loops).
 * **Word timestamps** (`whisper_trt/alignment.py`): CTranslate2's `align`, then faster-whisper's words. On the
   window's kept keys/values, one call of the PyTorch decoder on the same weights over `sot_sequence,
   <|notimestamps|>`, the text tokens and `<|endoftext|>` (in a CUDA graph per length bucket, the tokens padded
@@ -348,9 +349,11 @@ its first 30 s of the whole-recording features: on the 60 recordings above (fp32
 * `decode` / `decode_windows` take windows of at most 30 s (longer audio is trimmed; features are normalized
   over the whole input, as faster-whisper normalizes a clip); `transcribe` takes recordings of any length.
 * `transcribe` has no VAD filter, `clip_timestamps`, `prefix`, `hotwords` or per-segment language detection
-  (`multilingual`), nor `best_of` > `beam_size` > 1 (the samples decode in the beam search's rows). Long
-  prompts (previous text) and word timestamps need the default Triton decoder or the PyTorch backend (the
-  TensorRT decoder engine prefills at most 32 tokens).
+  (`multilingual`), nor `best_of` > `beam_size` > 1 (the samples decode in the beam search's rows). Its pool
+  of kept keys/values adds up to `kv_pool` x 245 MB to the decoding's memory (by default `min(recordings,
+  batch_size + 8)` buffers: about 10 GB at 32 slots; with a smaller `kv_pool`, the windows left out are encoded
+  again for their retries and alignment). Long prompts (previous text) and word timestamps need the default
+  Triton decoder or the PyTorch backend (the TensorRT decoder engine prefills at most 32 tokens).
 * Tested with torch 2.14.1 (CUDA 13) + TensorRT 11.4.0.106 on H200 only.
 
 ## Development

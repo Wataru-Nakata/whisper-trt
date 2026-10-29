@@ -416,8 +416,9 @@ class Whisper:
         suppress_blank, suppress_tokens, without_timestamps, max_initial_timestamp, word_timestamps,
         prepend_punctuations, append_punctuations, hallucination_silence_threshold,
         language_detection_threshold, language_detection_segments), batch_size, ``kv_pool`` (windows whose
-        keys/values are kept for their retries and alignment, default ``batch_size + 8``), seed (a window's
-        samples depend on it, the recording's index, the window's and the temperature's only)."""
+        keys/values are kept for their retries and alignment, default ``min(recordings, batch_size + 8)``),
+        seed (a window's samples depend on it, the recording's index, the window's and the temperature's
+        only)."""
         from .longform import transcribe
 
         return transcribe(self, audio, language, task, **options)

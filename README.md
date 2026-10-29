@@ -281,11 +281,11 @@ its first 30 s of the whole-recording features: on the 60 recordings above (fp32
   245 MB), serve its retries and its word alignment. Then faster-whisper's rules: a silent window skipped, the
   tokens split into segments, the seek moved to the last timestamp (with word timestamps, the last word's end),
   the prompt reset after a decode above temperature 0.5, `hallucination_silence_threshold` (implemented, not
-  compared: the comparisons above use faster-whisper's defaults, as for `initial_prompt`). Prompts of any length run in the
-  search's prefilled mode: a window's prompt but its last token goes through one decoder call (outside the
-  captured graph) into its slot's cache, and the step graph goes on from the slot's own position, with
-  CTranslate2's limit for that prompt, `min(224, 448 - prompt + 1)` new tokens (`tests/test_search.py`: prompts
-  of different lengths in refilled slots, against CTranslate2's loops).
+  compared: the comparisons above use faster-whisper's defaults, as for `initial_prompt`). Prompts of any
+  length run in the search's prefilled mode: a window's prompt but its last token goes through one decoder call
+  (outside the captured graph) into its slot's cache, and the step graph goes on from the slot's own position,
+  with CTranslate2's limit for that prompt, `min(224, 448 - prompt + 1)` new tokens (`tests/test_search.py`:
+  prompts of different lengths in refilled slots, against CTranslate2's loops).
 * **Word timestamps** (`whisper_trt/alignment.py`): CTranslate2's `align`, then faster-whisper's words. On the
   window's kept keys/values, one call of the PyTorch decoder on the same weights over `sot_sequence,
   <|notimestamps|>`, the text tokens and `<|endoftext|>` (in a CUDA graph per length bucket, the tokens padded
